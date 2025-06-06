@@ -171,7 +171,7 @@ def validate_credentials():
         profile_data = test_fyers.get_profile()
         if profile_data and profile_data.get('s') == 'ok':
             # [span_46](start_span)If valid, save this access token for future use by the backend[span_46](end_span)
-            (start_span)save_access_token(access_key)
+            save_access_token(access_key)
             global fyers
             [span_48](start_span)fyers = test_fyers # Set the global Fyers client[span_48](end_span)
             return jsonify({"success": True, "message": "Credentials validated and Fyers client initialized."}), 200
