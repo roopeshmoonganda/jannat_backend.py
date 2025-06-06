@@ -230,7 +230,7 @@ def get_ohlcv():
            "range_to": datetime.now().strftime('%Y-%m-%d'), 
            "cont_flag": "1" 
         }
-       response = fyers.history(data=data)
+            response = fyers.history(data=data)
         if response.get('s') == 'ok' and response.get('candles'): 
             Fyers API returns [timestamp, open, high, low, close, volume]
             return jsonify({"success": True, "candles": response['candles']}), 200
