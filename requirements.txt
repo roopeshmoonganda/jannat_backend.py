@@ -4,5 +4,5 @@ requests
 pandas
 ta
 gunicorn
-fyers-api==2.0.6
+fyers-api==1.0.9
 requests
