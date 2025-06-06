@@ -82,7 +82,7 @@ def generate_auth_url():
         session.redirect_uri = FYERS_REDIRECT_URI
         session.response_type = "code"
         session.grant_type = "authorization_code"
-        response = session.generate_authcode()
+        response = session.generate_authcode_url()
         return jsonify({"success": True, "auth_url": response}), 200
     except Exception as e:
         app.logger.error(f"Error generating Fyers auth URL: {e}")
@@ -104,7 +104,7 @@ def fyers_auth_callback():
         session.response_type = "code"
         session.grant_type = "authorization_code"
         session.set_token(auth_code)
-        response = session.generate_token()
+        response = session.generate_token_url()
         access_token = response["access_token"]
         save_access_token(access_token)
 
