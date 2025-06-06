@@ -78,7 +78,7 @@ def generate_auth_url():
     """Generates the Fyers authentication URL for manual login."""
     try:
         # Use accessToken.SessionModel for 1.0.9 compatibility
-        session = accessToken.SessionModel()
+        session = accessToken.SessionModel(FYERS_CLIENT_ID, FYERS_SECRET_ID)
         session.set_param({
             "app_id": FYERS_CLIENT_ID,
             "secret_key": FYERS_SECRET_ID,
@@ -103,7 +103,7 @@ def fyers_auth_callback():
 
     try:
         # Use accessToken.SessionModel for 1.0.9 compatibility
-        session = accessToken.SessionModel()
+        session = accessToken.SessionModel(FYERS_CLIENT_ID, FYERS_SECRET_ID)
         session.set_param({
             "app_id": FYERS_CLIENT_ID,
             "secret_key": FYERS_SECRET_ID,
