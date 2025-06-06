@@ -79,7 +79,7 @@ def generate_auth_url():
     try:
         # Use accessToken.SessionModel for 1.0.9 compatibility
         session = accessToken.SessionModel(
-            client_id=FYERS_CLIENT_ID,
+            app_id=FYERS_CLIENT_ID,
             secret_key=FYERS_SECRET_ID,
             redirect_uri=FYERS_REDIRECT_URI,
             response_type='code',
@@ -103,7 +103,7 @@ def fyers_auth_callback():
     try:
         # Use accessToken.SessionModel for 1.0.9 compatibility
         session = accessToken.SessionModel(
-            client_id=FYERS_CLIENT_ID,
+            app_id=FYERS_CLIENT_ID,
             secret_key=FYERS_SECRET_ID,
             redirect_uri=FYERS_REDIRECT_URI,
             response_type='code',
