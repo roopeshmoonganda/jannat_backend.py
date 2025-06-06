@@ -173,7 +173,7 @@ def validate_credentials():
             # [span_46](start_span)If valid, save this access token for future use by the backend[span_46](end_span)
             save_access_token(access_key)
             global fyers
-            [span_48](start_span)fyers = test_fyers # Set the global Fyers client[span_48](end_span)
+            fyers = test_fyers
             return jsonify({"success": True, "message": "Credentials validated and Fyers client initialized."}), 200
         else:
             app.logger.error(f"Access Key validation failed (Fyers response: {profile_data})")
