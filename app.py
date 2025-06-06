@@ -4,11 +4,11 @@ from flask import Flask, request, jsonify
 from datetime import datetime, timedelta
 from flask_cors import CORS
 
-
 # --- Fyers API V3 Imports ---
-# Make sure you have the latest fyers-api installed: pip install fyers-api
-from fyers_apiv3 import fyersModel
-from fyers_apiv3.FyersWebsocket import data_ws
+# Make sure you have the latest fyers-apiv3 installed: pip install fyers-apiv3
+from fyers_apiv3 import fyersModel # Correct import for the main Fyers client model
+from fyers_apiv3 import accessToken # Correct import for authentication session management
+from fyers_apiv3.FyersWebsocket import data_ws # Correct import for the data WebSocket client
 
 
 app = Flask(__name__)
@@ -29,8 +29,6 @@ FYERS_SECRET_ID = os.environ.get("FYERS_SECRET_ID", "YOUR_SECRET_ID_FROM_FYERS")
 FYERS_REDIRECT_URI = os.environ.get("FYERS_REDIRECT_URI", "https://www.google.com") # Must match your Fyers app settings
 # For V3, client_id might just be the FYERS_APP_ID directly. Refer to Fyers V3 docs for exact format.
 FYERS_CLIENT_ID = os.environ.get("FYERS_CLIENT_ID", f"{FYERS_APP_ID}-100" if FYERS_APP_ID != "YOUR_APP_ID_FROM_FYERS" else "")
-
-
 
 
 # This file will store the access token generated after authentication
@@ -64,8 +62,8 @@ def check_fyers_client_initialized():
         access_token = load_access_token()
         if access_token:
             try:
-                # V3 FyersApp initialization
-                fyers_api_client = FyersApp(token=access_token, is_async=False, client_id=FYERS_CLIENT_ID)
+                # V3 Fyers client initialization using fyersModel.FyersModel
+                fyers_api_client = fyersModel.FyersModel(token=access_token, is_async=False, client_id=FYERS_CLIENT_ID)
                 app.logger.info("Fyers client initialized from stored token.")
             except Exception as e:
                 app.logger.error(f"Error initializing Fyers client with stored token: {e}")
@@ -79,8 +77,8 @@ def check_fyers_client_initialized():
 def generate_auth_url():
     """Generates the Fyers authentication URL for manual login."""
     try:
-        # V3 SessionModel for authentication
-        session = SessionModel(
+        # V3 SessionModel for authentication using accessToken.SessionModel
+        session = accessToken.SessionModel(
             client_id=FYERS_CLIENT_ID,
             secret_key=FYERS_SECRET_ID,
             redirect_uri=FYERS_REDIRECT_URI,
@@ -102,10 +100,9 @@ def fyers_auth_callback():
         error = request.args.get('error')
         return jsonify({"success": False, "message": f"Fyers authentication failed: {error}"}), 400
 
-
     try:
-        # V3 SessionModel for token generation
-        session = SessionModel(
+        # V3 SessionModel for token generation using accessToken.SessionModel
+        session = accessToken.SessionModel(
             client_id=FYERS_CLIENT_ID,
             secret_key=FYERS_SECRET_ID,
             redirect_uri=FYERS_REDIRECT_URI,
@@ -119,8 +116,8 @@ def fyers_auth_callback():
 
 
         global fyers_api_client
-        # V3 FyersApp initialization with new token
-        fyers_api_client = FyersApp(token=access_token, is_async=False, client_id=FYERS_CLIENT_ID)
+        # V3 Fyers client initialization with new token using fyersModel.FyersModel
+        fyers_api_client = fyersModel.FyersModel(token=access_token, is_async=False, client_id=FYERS_CLIENT_ID)
         app.logger.info("Fyers client initialized successfully with new token.")
 
 
@@ -153,8 +150,8 @@ def validate_credentials():
     # Attempt to initialize Fyers client with the provided access key for a quick check
     # In a real scenario, you'd want to verify token validity with Fyers if possible.
     try:
-        # V3 FyersApp initialization
-        test_fyers_client = FyersApp(token=access_key, is_async=False, client_id=client_id)
+        # V3 Fyers client initialization using fyersModel.FyersModel
+        test_fyers_client = fyersModel.FyersModel(token=access_key, is_async=False, client_id=client_id)
         # Try a simple API call to verify token (e.g., get profile)
         profile_data = test_fyers_client.get_profile()
         if profile_data and profile_data.get('s') == 'ok':
@@ -168,7 +165,7 @@ def validate_credentials():
             return jsonify({"success": False, "message": "Access Key invalid or expired."}), 401
     except Exception as e:
         app.logger.error(f"Error validating access key: {e}")
-        return jsonify({"success": False, "message": f"Error validating credentials: {e}"}), 500
+        return jsonify({"success": False, "message": f"Internal server error validating credentials: {e}"}), 500
 
 
 @app.route("/save_and_validate_credentials", methods=["POST"])
@@ -300,7 +297,7 @@ def execute_trade():
                 "productType": product_type,
                 "validity": "DAY",
                 "disclosedQty": 0,
-                "offlineOrder": "False",
+                "offlineOrder": False, # Changed from "False" to boolean False
                 "stopLoss": float(stop_loss) if stop_loss else 0, # SL for SL/SL-M/SL-L orders
                 "takeProfit": float(target) if target else 0 # Target for take profit (if supported as part of single order)
             }
