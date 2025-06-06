@@ -1,0 +1,10 @@
+services:
+  - type: web
+    name: jannat-backend
+    runtime: python
+    buildCommand: ""
+    startCommand: gunicorn app:app
+    env: python
+    region: oregon
+    plan: free
+    autoDeploy: true
