@@ -3,7 +3,7 @@ import json
 from flask import Flask, request, jsonify
 from datetime import datetime, timedelta
 # Install the Fyers API Python SDK: pip install fyers-api
-from fyers_api import fyersClient
+from fyers_api import accessToken, fyersClient
 from fyers_api.Websocket import ws
 
 
@@ -113,7 +113,7 @@ def fyers_auth_callback():
         save_access_token(access_token) # Store the access token securely
         
         global fyers
-        fyers = fyersClient.FyersClient(token=access_token, is_async=False, client_id=FYERS_CLIENT_ID, log_path=os.getcwd())
+        fyers = fyersModel.FyersModel(token=access_token, is_async=False, client_id=FYERS_CLIENT_ID, log_path=os.getcwd())
         app.logger.info("Fyers client initialized successfully with new token.")
 
 
