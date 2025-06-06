@@ -7,7 +7,7 @@ from flask_cors import CORS
 
 # --- Fyers API V3 Imports ---
 # Make sure you have the latest fyers-api installed: pip install fyers-api
-from fyers_apiv3 import SessionModel, fyersModel
+from fyers_apiv3 import fyersModel
 from fyers_apiv3.FyersWebsocket import FyersDataSocket
 
 
