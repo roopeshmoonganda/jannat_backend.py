@@ -78,13 +78,14 @@ def generate_auth_url():
     """Generates the Fyers authentication URL for manual login."""
     try:
         # Use accessToken.SessionModel for 1.0.9 compatibility
-        session = accessToken.SessionModel(
+        session = accessToken.SessionModel()
+        session.set_param({
             app_id=FYERS_CLIENT_ID,
             secret_key=FYERS_SECRET_ID,
             redirect_uri=FYERS_REDIRECT_URI,
             response_type='code',
             grant_type='authorization_code'
-        )
+        })
         response = session.generate_authcode()
         return jsonify({"success": True, "auth_url": response}), 200
     except Exception as e:
@@ -102,13 +103,14 @@ def fyers_auth_callback():
 
     try:
         # Use accessToken.SessionModel for 1.0.9 compatibility
-        session = accessToken.SessionModel(
+        session = accessToken.SessionModel()
+        session.set_param({
             app_id=FYERS_CLIENT_ID,
             secret_key=FYERS_SECRET_ID,
             redirect_uri=FYERS_REDIRECT_URI,
             response_type='code',
             grant_type='authorization_code'
-        )
+        })
         session.set_token(auth_code)
         response = session.generate_token()
         access_token = response["access_token"]
