@@ -6,8 +6,7 @@ from flask_cors import CORS
 
 # --- Fyers API V3 Imports ---
 # Make sure you have the latest fyers-apiv3 installed: pip install fyers-apiv3
-from fyers_apiv3 import fyersModel # Correct import for the main Fyers client model
-from fyers_apiv3 import accessToken # Correct import for authentication session management
+from fyers_apiv3 import fyersModel # Correct import for the main Fyers client model (includes SessionModel)
 from fyers_apiv3.FyersWebsocket import data_ws # Correct import for the data WebSocket client
 
 
@@ -42,7 +41,7 @@ fyers_api_client = None
 def load_access_token():
     """Loads the access token from a file."""
     if os.path.exists(ACCESS_TOKEN_STORAGE_FILE):
-        with open(ACCESS_TOKEN_STORAGE_FILE, 'r') as f:
+        with open(ACCESS_TOKEN_STORAGE, 'r') as f:
             data = json.load(f)
             return data.get('access_token')
     return None
@@ -77,8 +76,8 @@ def check_fyers_client_initialized():
 def generate_auth_url():
     """Generates the Fyers authentication URL for manual login."""
     try:
-        # V3 SessionModel for authentication using accessToken.SessionModel
-        session = accessToken.SessionModel(
+        # V3 SessionModel for authentication using fyersModel.SessionModel
+        session = fyersModel.SessionModel( # Corrected: fyersModel.SessionModel
             client_id=FYERS_CLIENT_ID,
             secret_key=FYERS_SECRET_ID,
             redirect_uri=FYERS_REDIRECT_URI,
@@ -101,8 +100,8 @@ def fyers_auth_callback():
         return jsonify({"success": False, "message": f"Fyers authentication failed: {error}"}), 400
 
     try:
-        # V3 SessionModel for token generation using accessToken.SessionModel
-        session = accessToken.SessionModel(
+        # V3 SessionModel for token generation using fyersModel.SessionModel
+        session = fyersModel.SessionModel( # Corrected: fyersModel.SessionModel
             client_id=FYERS_CLIENT_ID,
             secret_key=FYERS_SECRET_ID,
             redirect_uri=FYERS_REDIRECT_URI,
