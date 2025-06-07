@@ -3,8 +3,8 @@ import json
 from flask import Flask, request, jsonify
 from datetime import datetime, timedelta
 from flask_cors import CORS
-import threading 
-from jannat_algo_engine import execute_strategy
+import threading
+from jannat_algo_engine import execute_strategy # Corrected: 'execute_strategy' imported
 
 # --- Fyers API V3 Imports ---
 # Make sure you have the latest fyers-apiv3 installed: pip install fyers-apiv3
@@ -27,255 +27,264 @@ CORS(app) # Enable CORS for deployment compatibility
 
 FYERS_APP_ID = os.environ.get("FYERS_APP_ID", "YOUR_APP_ID_FROM_FYERS")
 FYERS_SECRET_ID = os.environ.get("FYERS_SECRET_ID", "YOUR_SECRET_ID_FROM_FYERS")
-FYERS_REDIRECT_URI = os.environ.get("FYERS_REDIRECT_URI", "https://www.google.com") # Must match your Fyers app settings
-# For V3, client_id might just be the FYERS_APP_ID directly. Refer to Fyers V3 docs for exact format.
-FYERS_CLIENT_ID = os.environ.get("FYERS_CLIENT_ID", f"{FYERS_APP_ID}-100" if FYERS_APP_ID != "YOUR_APP_ID_FROM_FYERS" else "")
+FYERS_REDIRECT_URI = os.environ.get("FYERS_REDIRECT_URI", "https://jannat-backend-py.onrender.com/fyers_auth_callback") # Ensure this matches your Render URL
+FYERS_CLIENT_ID = os.environ.get("FYERS_CLIENT_ID", FYERS_APP_ID + "-100") # Default to App ID + "-100"
 
-
-# This file will store the access token generated after authentication
-# Use a path on the persistent disk for deployment
-ACCESS_TOKEN_STORAGE_FILE = os.path.join(os.environ.get("PERSISTENT_DISK_PATH", "."), "fyers_access_token.json")
-
-
-# Global Fyers client instance
+# Global variable to store the Fyers API client instance
 fyers_api_client = None
+# Global variable to store the access token (for simplicity; better to use a database in production)
+ACCESS_TOKEN = None
 
+# --- File paths for persistent storage on Render's disk ---
+# The "PERSISTENT_DISK_PATH" environment variable will be set by Render.
+# If running locally, it defaults to the current directory.
+PERSISTENT_DISK_BASE_PATH = os.environ.get("PERSISTENT_DISK_PATH", ".")
+ACCESS_TOKEN_STORAGE_FILE = os.path.join(PERSISTENT_DISK_BASE_PATH, "fyers_access_token.json")
+
+# --- Helper Functions ---
+def save_access_token(token_data):
+    try:
+        with open(ACCESS_TOKEN_STORAGE_FILE, "w") as f:
+            json.dump(token_data, f)
+        app.logger.info(f"Access token saved to {ACCESS_TOKEN_STORAGE_FILE}")
+    except IOError as e:
+        app.logger.error(f"Error saving access token: {e}")
 
 def load_access_token():
-    """
-    Loads the access token, prioritizing environment variable, then file from persistent disk.
-    """
-    # Try loading from environment variable first (for initial setup or quick override)
-    env_access_token = os.environ.get("FYERS_ACCESS_TOKEN")
-    if env_access_token:
-        app.logger.info("Fyers access token loaded from environment variable.")
-        return env_access_token
-
-    # Fallback to loading from file on persistent disk
-    if os.path.exists(ACCESS_TOKEN_STORAGE_FILE):
-        try:
-            with open(ACCESS_TOKEN_STORAGE_FILE, 'r') as f:
-                data = json.load(f)
-                app.logger.info("Fyers access token loaded from persistent file.")
-                return data.get('access_token')
-        except Exception as e:
-            app.logger.error(f"Error loading access token from file: {e}")
-    return None
-
-
-def save_access_token(token):
-    """
-    Saves the access token to the persistent disk.
-    """
+    global ACCESS_TOKEN
     try:
-        # Ensure the directory exists before writing the file
-        os.makedirs(os.path.dirname(ACCESS_TOKEN_STORAGE_FILE), exist_ok=True)
-        with open(ACCESS_TOKEN_STORAGE_FILE, 'w') as f:
-            json.dump({'access_token': token, 'timestamp': datetime.now().isoformat()}, f)
-            app.logger.info(f"Access token saved to persistent disk: {ACCESS_TOKEN_STORAGE_FILE}")
+        if os.path.exists(ACCESS_TOKEN_STORAGE_FILE):
+            with open(ACCESS_TOKEN_STORAGE_FILE, "r") as f:
+                token_data = json.load(f)
+                ACCESS_TOKEN = token_data.get('access_token')
+                app.logger.info(f"Access token loaded from {ACCESS_TOKEN_STORAGE_FILE}")
+                return token_data
+        app.logger.warning("No access token file found.")
+        return None
+    except json.JSONDecodeError as e:
+        app.logger.error(f"Error decoding access token JSON: {e}")
+        return None
     except IOError as e:
-        app.logger.error(f"Could not write access token to persistent disk: {e}")
+        app.logger.error(f"Error loading access token: {e}")
+        return None
 
-
-@app.before_request
-def check_fyers_client_initialized():
-    """Ensures Fyers client is initialized before processing requests."""
+def initialize_fyers_client(access_token):
     global fyers_api_client
-    if fyers_api_client is None:
-        access_token = load_access_token()
-        if access_token:
-            try:
-                # V3 Fyers client initialization using fyersModel.FyersModel
-                fyers_api_client = fyersModel.FyersModel(token=access_token, is_async=False, client_id=FYERS_CLIENT_ID)
-                app.logger.info("Fyers client initialized from stored token.")
-            except Exception as e:
-                app.logger.error(f"Error initializing Fyers client with stored token: {e}")
-                fyers_api_client = None # Reset if initialization fails
-        else:
-            app.logger.warning("Fyers access token not found or expired. Please authenticate via /generate_auth_url or set FYERS_ACCESS_TOKEN environment variable.")
+    if access_token:
+        try:
+            fyers_api_client = fyersModel.FyersModel(
+                client_id=FYERS_CLIENT_ID,
+                is_async=False, # Set to True for async operations
+                token=access_token,
+                log_path=os.path.join(PERSISTENT_DISK_BASE_PATH, "fyers_logs") # Path for Fyers API logs
+            )
+            app.logger.info("Fyers API client initialized with access token.")
+            return True
+        except Exception as e:
+            app.logger.error(f"Error initializing Fyers API client: {e}")
+            return False
+    return False
 
+# --- Flask Routes ---
 
-# --- Fyers Authentication Flow ---
-@app.route("/generate_auth_url")
+@app.route("/")
+def home():
+    return "Jannat Algo Backend is running!"
+
+@app.route("/generate_auth_url", methods=["GET"])
 def generate_auth_url():
-    """Generates the Fyers authentication URL for manual login."""
-    try:
-        # V3 SessionModel for authentication using fyersModel.SessionModel
-        session = fyersModel.SessionModel(
-            client_id=FYERS_CLIENT_ID,
-            secret_key=FYERS_SECRET_ID,
-            redirect_uri=FYERS_REDIRECT_URI,
-            response_type='code',
-            grant_type='authorization_code'
-        )
-        response = session.generate_authcode()
-        return jsonify({"success": True, "auth_url": response}), 200
-    except Exception as e:
-        app.logger.error(f"Error generating Fyers auth URL: {e}")
-        return jsonify({"success": False, "message": f"Failed to generate auth URL: {e}"}), 500
+    session = fyersModel.SessionModel(
+        client_id=FYERS_CLIENT_ID,
+        secret_key=FYERS_SECRET_ID,
+        redirect_uri=FYERS_REDIRECT_URI,
+        response_type="code",
+        grant_type="authorization_code"
+    )
+    auth_url = session.generate_authcode()
+    app.logger.info(f"Generated Fyers Auth URL: {auth_url}")
+    return jsonify({"auth_url": auth_url})
 
-
-@app.route("/fyers_auth_callback")
+@app.route("/fyers_auth_callback", methods=["GET"])
 def fyers_auth_callback():
-    """Callback endpoint for Fyers OAuth flow."""
-    auth_code = request.args.get('auth_code')
+    global ACCESS_TOKEN
+    auth_code = request.args.get("auth_code")
     if not auth_code:
-        error = request.args.get('error')
-        return jsonify({"success": False, "message": f"Fyers authentication failed: {error}"}), 400
+        app.logger.error("Authorization code not found in callback.")
+        return jsonify({"success": False, "message": "Authorization code not found."}), 400
+
+    session = fyersModel.SessionModel(
+        client_id=FYERS_CLIENT_ID,
+        secret_key=FYERS_SECRET_ID,
+        redirect_uri=FYERS_REDIRECT_URI,
+        response_type="code",
+        grant_type="authorization_code"
+    )
 
     try:
-        # V3 SessionModel for token generation using fyersModel.SessionModel
-        session = fyersModel.SessionModel(
-            client_id=FYERS_CLIENT_ID,
-            secret_key=FYERS_SECRET_ID,
-            redirect_uri=FYERS_REDIRECT_URI,
-            response_type='code',
-            grant_type='authorization_code'
-        )
         session.set_token(auth_code)
         response = session.generate_token()
-        access_token = response["access_token"]
-        save_access_token(access_token) # Store the access token securely
 
-
-        global fyers_api_client
-        # V3 Fyers client initialization with new token using fyersModel.FyersModel
-        fyers_api_client = fyersModel.FyersModel(token=access_token, is_async=False, client_id=FYERS_CLIENT_ID)
-        app.logger.info("Fyers client initialized successfully with new token.")
-
-
-        return jsonify({"success": True, "message": "Fyers token generated and saved successfully!", "access_token": access_token}), 200
-    except Exception as e:
-        app.logger.error(f"Error processing Fyers auth callback: {e}")
-        return jsonify({"success": False, "message": f"Failed to generate token: {e}"}), 500
-
-
-# Endpoint for the React Native app to validate credentials (App ID, Secret ID, Client ID)
-# and ensure backend has a valid access token.
-@app.route("/validate_credentials", methods=["POST"])
-def validate_credentials():
-    data = request.json
-    app_id = data.get('app_id')
-    secret_id = data.get('secret_id')
-    client_id = data.get('client_id')
-    access_key = data.get('access_key') # Access key sent from fyers_token.txt
-
-
-    if not all([app_id, secret_id, client_id, access_key]):
-        return jsonify({"success": False, "message": "Missing App ID, Secret ID, Client ID, or Access Key"}), 400
-
-
-    # Basic validation: Check if provided IDs match backend config (environment variables)
-    if app_id != FYERS_APP_ID or secret_id != FYERS_SECRET_ID or client_id != FYERS_CLIENT_ID:
-        return jsonify({"success": False, "message": "App ID, Secret ID, or Client ID mismatch with backend configuration."}), 401
-
-
-    # Attempt to initialize Fyers client with the provided access key for a quick check
-    # In a real scenario, you'd want to verify token validity with Fyers if possible.
-    try:
-        # V3 Fyers client initialization using fyersModel.FyersModel
-        test_fyers_client = fyersModel.FyersModel(token=access_key, is_async=False, client_id=client_id)
-        # Try a simple API call to verify token (e.g., get profile)
-        profile_data = test_fyers_client.get_profile()
-        if profile_data and profile_data.get('s') == 'ok':
-            # If valid, save this access token for future use by the backend
-            save_access_token(access_key)
-            global fyers_api_client
-            fyers_api_client = test_fyers_client # Set the global Fyers client
-            return jsonify({"success": True, "message": "Credentials validated and Fyers client initialized."}), 200
+        if response and response.get('s') == 'ok':
+            ACCESS_TOKEN = response.get("access_token")
+            if ACCESS_TOKEN:
+                save_access_token({"access_token": ACCESS_TOKEN, "timestamp": datetime.now().isoformat()})
+                initialize_fyers_client(ACCESS_TOKEN)
+                app.logger.info("Fyers access token obtained and saved successfully.")
+                return jsonify({"success": True, "message": "Fyers authentication successful!", "access_token_present": True}), 200
+            else:
+                app.logger.error("Access token not found in Fyers response.")
+                return jsonify({"success": False, "message": "Access token not found in Fyers response."}), 500
         else:
-            app.logger.error(f"Access Key validation failed (Fyers response: {profile_data})")
-            return jsonify({"success": False, "message": "Access Key invalid or expired."}), 401
+            error_message = response.get('message', 'Unknown error during token generation.')
+            app.logger.error(f"Fyers token generation failed: {error_message}")
+            return jsonify({"success": False, "message": f"Fyers token generation failed: {error_message}"}), 500
     except Exception as e:
-        app.logger.error(f"Error validating access key: {e}")
-        return jsonify({"success": False, "message": f"Internal server error validating credentials: {e}"}), 500
+        app.logger.error(f"Error during Fyers authentication callback: {e}")
+        return jsonify({"success": False, "message": f"Authentication failed: {e}"}), 500
+
+@app.route("/validate_credentials", methods=["GET"])
+def validate_credentials():
+    # Attempt to load token and initialize client if not already
+    global fyers_api_client, ACCESS_TOKEN
+    if not fyers_api_client and ACCESS_TOKEN:
+        initialize_fyers_client(ACCESS_TOKEN)
+    elif not fyers_api_client:
+        token_data = load_access_token()
+        if token_data:
+            initialize_fyers_client(token_data.get('access_token'))
+
+    if fyers_api_client:
+        try:
+            # Make a simple API call to validate credentials, e.g., get user profile
+            profile_info = fyers_api_client.get_profile()
+            if profile_info and profile_info.get('s') == 'ok':
+                user_name = profile_info.get('data', {}).get('name', 'Unknown User')
+                app.logger.info(f"Fyers credentials valid for: {user_name}")
+                return jsonify({"status": "success", "message": f"Credentials valid for {user_name}"}), 200
+            else:
+                error_message = profile_info.get('message', 'Failed to get profile information.')
+                app.logger.error(f"Fyers credentials invalid: {error_message}")
+                return jsonify({"status": "error", "message": f"Invalid Fyers credentials: {error_message}"}), 401
+        except Exception as e:
+            app.logger.error(f"Error validating Fyers credentials: {e}")
+            return jsonify({"status": "error", "message": f"Error validating credentials: {e}"}), 500
+    else:
+        app.logger.warning("Fyers client not initialized. No access token found or initialization failed.")
+        return jsonify({"status": "error", "message": "Fyers client not initialized. Please authenticate."}), 401
 
 
 @app.route("/save_and_validate_credentials", methods=["POST"])
-def save_and_validate_credentials():
+def save_and_validate_credentials_route():
     data = request.json
-    app_id = data.get('app_id')
-    secret_id = data.get('secret_id')
+    client_id = data.get("client_id")
+    secret_key = data.get("secret_key")
+    redirect_uri = data.get("redirect_uri") # This should be the one from Fyers App settings
+
+    if not all([client_id, secret_key, redirect_uri]):
+        return jsonify({"success": False, "message": "Missing Fyers credentials."}), 400
+
+    # In a real application, you would save these securely (e.g., to a database)
+    # For now, we'll just attempt to generate the auth URL to validate.
+    # Note: For Render, environment variables are the primary way to persist these.
+    # This route is more for local testing or initial setup.
+
+    session = fyersModel.SessionModel(
+        client_id=client_id,
+        secret_key=secret_key,
+        redirect_uri=redirect_uri,
+        response_type="code",
+        grant_type="authorization_code"
+    )
+
+    try:
+        auth_url = session.generate_authcode()
+        app.logger.info(f"Successfully generated auth URL for provided credentials.")
+        return jsonify({
+            "success": True,
+            "message": "Credentials seem valid, proceed to Fyers authentication.",
+            "auth_url": auth_url
+        }), 200
+    except Exception as e:
+        app.logger.error(f"Failed to generate auth URL with provided credentials: {e}")
+        return jsonify({"success": False, "message": f"Invalid Fyers credentials provided: {e}"}), 401
 
 
-    if not all([app_id, secret_id]):
-        return jsonify({"success": False, "message": "Missing App ID or Secret ID"}), 400
-
-
-    if app_id == FYERS_APP_ID and secret_id == FYERS_SECRET_ID:
-        return jsonify({"success": True, "message": "App ID and Secret ID matched backend configuration. Now generate/load access token."}), 200
-    else:
-        return jsonify({"success": False, "message": "App ID or Secret ID mismatch with backend configuration. Please check your credentials or backend setup."}), 401
-
-
-# --- Data Endpoints ---
-@app.route("/data/ohlcv")
-def get_ohlcv():
+@app.route("/data/ohlcv", methods=["POST"])
+def get_ohlcv_data():
     global fyers_api_client
     if not fyers_api_client:
         return jsonify({"success": False, "message": "Fyers client not initialized. Authenticate first."}), 401
 
+    data = request.json
+    symbol = data.get('symbol')
+    resolution = data.get('resolution', '15') # e.g., "1", "5", "15", "60", "240", "D"
+    range_from = data.get('range_from') # YYYY-MM-DD
+    range_to = data.get('range_to')     # YYYY-MM-DD
 
-    symbol = request.args.get('symbol', "NSE:BANKNIFTY")
-    # For V3, resolution might need specific string values, e.g., "1min", "5min", "D"
-    interval = request.args.get('interval', "1min") # Changed default to V3 compatible string
-    days = request.args.get('days', "3")
-
+    if not all([symbol, resolution, range_from, range_to]):
+        return jsonify({"success": False, "message": "Missing data parameters."}), 400
 
     try:
-        # V3 history method parameters
-        # The Fyers API V3 history parameters are often 'symbol', 'resolution', 'date_range' (tuple/list of start, end)
-        # Assuming the 'days' parameter is used to calculate the date range.
-        range_from = (datetime.now() - timedelta(days=int(days))).strftime('%Y-%m-%d')
-        range_to = datetime.now().strftime('%Y-%m-%d')
+        history_data = {
+            "symbol": symbol,
+            "resolution": resolution,
+            "date_format": "1",  # 1 for YYYY-MM-DD
+            "range_from": range_from,
+            "range_to": range_to,
+            "cont_flag": "1" # 1 for historical data
+        }
+        response = fyers_api_client.history(data=history_data)
 
-
-        response = fyers_api_client.history(symbol=symbol, resolution=interval, date_range=[range_from, range_to])
-
-
-        if response.get('s') == 'ok' and response.get('candles'):
-            return jsonify({"success": True, "candles": response['candles']}), 200
+        if response.get('s') == 'ok':
+            # Format data if needed, Fyers returns [timestamp, open, high, low, close, volume]
+            candles = response.get('candles', [])
+            # Convert timestamp to human-readable format if desired
+            formatted_candles = [
+                {
+                    "time": datetime.fromtimestamp(c[0]).strftime('%Y-%m-%d %H:%M:%S'),
+                    "open": c[1],
+                    "high": c[2],
+                    "low": c[3],
+                    "close": c[4],
+                    "volume": c[5]
+                } for c in candles
+            ]
+            return jsonify({"success": True, "data": formatted_candles}), 200
         else:
-            app.logger.error(f"Fyers OHLCV API error: {response.get('message', 'Unknown error')}")
-            return jsonify({"success": False, "message": response.get('message', 'Failed to fetch OHLCV data from Fyers.')}), 500
+            return jsonify({"success": False, "message": response.get('message', 'Failed to fetch OHLCV data.')}), 500
     except Exception as e:
-        app.logger.error(f"Error fetching OHLCV data: {e}")
-        return jsonify({"success": False, "message": f"Internal server error fetching OHLCV: {e}"}), 500
+        return jsonify({"success": False, "message": f"Error fetching OHLCV data: {e}"}), 500
 
-
-@app.route("/data/quote")
-def get_quote():
+@app.route("/data/quote", methods=["POST"])
+def get_quote_data():
     global fyers_api_client
     if not fyers_api_client:
         return jsonify({"success": False, "message": "Fyers client not initialized. Authenticate first."}), 401
 
+    data = request.json
+    symbols = data.get('symbols') # List of symbols, e.g., ["NSE:BANKNIFTY", "NSE:NIFTY"]
 
-    symbol = request.args.get('symbol', "NSE:BANKNIFTY")
-
+    if not symbols or not isinstance(symbols, list):
+        return jsonify({"success": False, "message": "Missing or invalid symbols parameter (must be a list).", "symbols": symbols}), 400
 
     try:
-        # V3 quotes method parameters - takes a comma-separated string of symbols
-        response = fyers_api_client.quotes(symbols=symbol)
-        
-        # V3 response structure for quotes might be different.
-        # Assuming 'd' contains the data and 'v' has the quote details.
-        if response.get('s') == 'ok' and response.get('d') and response['d'][0].get('v'):
-            return jsonify({"success": True, "quote": response['d'][0]['v']}), 200
+        # Fyers API expects symbols as a comma-separated string
+        symbols_str = ','.join(symbols)
+        response = fyers_api_client.quotes(data={"symbols": symbols_str})
+
+        if response.get('s') == 'ok':
+            return jsonify({"success": True, "data": response.get('d', [])}), 200
         else:
-            app.logger.error(f"Fyers Quote API error: {response.get('message', 'Unknown error')}")
-            return jsonify({"success": False, "message": response.get('message', 'Failed to fetch quote from Fyers.')}), 500
+            return jsonify({"success": False, "message": response.get('message', 'Failed to fetch quote data.')}), 500
     except Exception as e:
-        app.logger.error(f"Error fetching quote: {e}")
-        return jsonify({"success": False, "message": f"Internal server error fetching quote: {e}"}), 500
+        return jsonify({"success": False, "message": f"Error fetching quote data: {e}"}), 500
 
 
-# --- Trade Execution Endpoint ---
 @app.route("/trade/execute", methods=["POST"])
 def execute_trade():
     global fyers_api_client
     if not fyers_api_client:
         return jsonify({"success": False, "message": "Fyers client not initialized. Authenticate first."}), 401
-
 
     data = request.json
     symbol = data.get('symbol')
@@ -289,13 +298,10 @@ def execute_trade():
     order_type = data.get('orderType') # "LIMIT", "MARKET"
     trade_mode = data.get('tradeMode') # "PAPER" or "LIVE"
 
-
     if not all([symbol, signal, entry_price, target, stop_loss, quantity, product_type, order_type, trade_mode]):
         return jsonify({"success": False, "message": "Missing trade parameters."}), 400
 
-
     app.logger.info(f"Received trade request: {data}")
-
 
     # --- Paper Trading Logic ---
     if trade_mode == "PAPER":
@@ -303,13 +309,12 @@ def execute_trade():
         app.logger.info(f"Simulating paper trade for {symbol} ({signal}) - Order ID: {simulated_order_id}")
         return jsonify({"success": True, "message": "Paper trade simulated successfully.", "orderId": simulated_order_id}), 200
 
-
     # --- Live Trading Logic ---
     elif trade_mode == "LIVE":
         try:
             # Determine side: 1 for BUY, -1 for SELL
             side = 1 if signal == "BUY" else -1
-            
+
             # V3 Order Data Structure - check Fyers API V3 documentation for exact keys and values
             # This is a generic structure; for options, you'll need the correct instrument symbol.
             order_data = {
@@ -320,7 +325,7 @@ def execute_trade():
                 "productType": product_type,
                 "validity": "DAY",
                 "disclosedQty": 0,
-                "offlineOrder": False, # Changed from "False" to boolean False
+                "offlineOrder": False,
                 "stopLoss": float(stop_loss) if stop_loss else 0, # SL for SL/SL-M/SL-L orders
                 "takeProfit": float(target) if target else 0 # Target for take profit (if supported as part of single order)
             }
@@ -347,15 +352,16 @@ def execute_trade():
             return jsonify({"success": False, "message": f"Internal server error placing live trade: {e}"}), 500
     else:
         return jsonify({"success": False, "message": "Invalid trade mode specified."}), 400
-        @app.route('/start_algo',
-                   methods=['GET', 'POST'])
-        def start_algo():
-            try:
-                threading.Thread(target=run_stratergy).start()
-                return jsonify({"status": "Algo Started"}), 200
-            except Exception as e:
-                return jsonify({"status": "Failed to start algo", "error": str(e)}), 500
 
+# CORRECTED INDENTATION: This route must be at the same level as other @app.route decorators
+@app.route('/start_algo', methods=['GET', 'POST'])
+def start_algo():
+    try:
+        # CORRECTED: Call execute_strategy from jannat_algo_engine
+        threading.Thread(target=execute_strategy).start()
+        return jsonify({"status": "Algo Started"}), 200
+    except Exception as e:
+        return jsonify({"status": "Failed to start algo", "error": str(e)}), 500
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000, debug=True)
