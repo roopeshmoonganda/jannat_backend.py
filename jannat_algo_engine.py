@@ -10,11 +10,11 @@ import numpy as np # For numerical operations, especially for indicators
 # --- Configuration ---
 # URL of your deployed Flask backend
 # IMPORTANT: Change this to your actual deployed Flask backend URL
-FLASK_BACKEND_URL = "https://jannat-backend-py.onrender.com/" # <--- **UPDATE THIS URL IF IT'S DIFFERENT**
+FLASK_BACKEND_URL = "https://jannat-backend-py.onrender.com/" # <--- **UPDATE THIS URL**
 
 # File paths for persistent storage on Render's disk
 # The "PERSISTENT_DISK_PATH" environment variable will be set by Render.
-# If running locally, it defaults to the current directory.
+# If running locally, it defaults to the current directory.\
 PERSISTENT_DISK_BASE_PATH = os.environ.get("PERSISTENT_DISK_PATH", ".")
 ACCESS_TOKEN_STORAGE_FILE = os.path.join(PERSISTENT_DISK_BASE_PATH, "fyers_access_token.json")
 CAPITAL_FILE = os.path.join(PERSISTENT_DISK_BASE_PATH, "jannat_capital.json")
@@ -35,14 +35,8 @@ ORDER_TYPE = "MARKET" # MARKET or LIMIT
 TRADE_MODE = "PAPER" # "PAPER" for simulated trades, "LIVE" for real trades
 TRADE_INTERVAL_SECONDS = 60 * 5 # Check and trade every 5 minutes
 
-# Market Hours (IST)
-MARKET_OPEN_TIME = datetime.strptime("09:15", "%H:%M").time()
-MARKET_CLOSE_TIME = datetime.strptime("15:30", "%H:%M").time()
-MARKET_CUTOFF_TIME = datetime.strptime("15:20", "%H:%M").time() # Stop trading before market close
-
-
 # Global variables for trade management and PnL tracking
-current_day = datetime.now().date()
+current_day = datetime.now().date() # Initial global declaration
 daily_pnl = 0.0
 total_trades = 0
 capital_data = {} # Stores current capital, daily PnL, etc.
@@ -51,7 +45,7 @@ trade_log = [] # Stores details of executed trades
 # --- Helper Functions for Persistence ---
 
 def load_capital_data():
-    global capital_data, daily_pnl, total_trades, current_day
+    global capital_data, daily_pnl, total_trades, current_day # Make current_day global here too
     try:
         if os.path.exists(CAPITAL_FILE):
             with open(CAPITAL_FILE, "r") as f:
@@ -189,9 +183,9 @@ def execute_trade_on_backend(symbol, signal, entry_price, target, stop_loss, atm
         "stopLoss": stop_loss,
         "atmStrike": atm_strike, # May not be directly used by Fyers API, but for your internal logic
         "quantity": quantity,
-        "productType": product_type,
-        "orderType": order_type,
-        "tradeMode": trade_mode
+        "product_type": product_type,
+        "order_type": order_type,
+        "trade_mode": trade_mode
     }
     try:
         response = requests.post(f"{FLASK_BACKEND_URL}trade/execute", json=payload)
@@ -276,53 +270,11 @@ def calculate_rsi(candles, period=14):
     rsi = 100 - (100 / (1 + rs))
     return rsi
 
-# --- Trading Strategy Logic ---
-
-def determine_signal(ohlcv_data, current_price):
-    """
-    Simple Moving Average (SMA) Crossover Strategy:
-    - If 15-period SMA crosses above 50-period SMA, generate BUY signal.
-    - If 15-period SMA crosses below 50-period SMA, generate SELL signal.
-    - Also considers RSI for confirmation.
-    """
-    if not ohlcv_data or len(ohlcv_data) < 50: # Need enough data for 50-period SMA
-        app.logger.warning("Not enough OHLCV data for SMA/RSI calculation.")
-        return None, None # No signal
-
-    sma_fast = calculate_sma(ohlcv_data, 15)
-    sma_slow = calculate_sma(ohlcv_data, 50)
-    rsi = calculate_rsi(ohlcv_data, 14)
-
-    if sma_fast is None or sma_slow is None or rsi is None:
-        app.logger.warning("SMA or RSI calculation failed.")
-        return None, None
-
-    app.logger.info(f"SMA(15): {sma_fast:.2f}, SMA(50): {sma_slow:.2f}, RSI(14): {rsi:.2f}, Current Price: {current_price:.2f}")
-
-    signal = None
-    target_option_type = None # "CE" or "PE"
-
-    # BUY Signal: Fast SMA > Slow SMA AND RSI > 50
-    if sma_fast > sma_slow and rsi > 50:
-        signal = "BUY"
-        target_option_type = "CE" # Buy Call Option
-        app.logger.info("Generated BUY signal (SMA Crossover Up + RSI > 50)")
-    # SELL Signal: Fast SMA < Slow SMA AND RSI < 50
-    elif sma_fast < sma_slow and rsi < 50:
-        signal = "SELL"
-        target_option_type = "PE" # Buy Put Option
-        app.logger.info("Generated SELL signal (SMA Crossover Down + RSI < 50)")
-    else:
-        app.logger.info("No strong signal detected.")
-
-    return signal, target_option_type
-
-
 # --- Core Algo Engine Logic ---
 
 def execute_strategy():
     """Main function to run the trading strategy."""
-    global daily_pnl, total_trades, capital_data, trade_log
+    global daily_pnl, total_trades, capital_data, trade_log, current_day # Added current_day to global
 
     load_capital_data() # Load capital data at start
     load_trade_log() # Load trade log at start
@@ -337,7 +289,7 @@ def execute_strategy():
             app.logger.info(f"New day detected: {current_time.date()}. Resetting daily PnL and trade count.")
             daily_pnl = 0.0
             total_trades = 0
-            current_day = current_time.date()
+            current_day = current_time.date() # This assignment now refers to the global variable
             # Ensure capital data is saved with new date and reset PnL for the new day
             capital_data['daily_pnl'] = daily_pnl
             capital_data['total_trades_today'] = total_trades
