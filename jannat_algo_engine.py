@@ -8,7 +8,7 @@ import numpy as np # For numerical operations, especially for indicators
 
 # --- Configuration ---
 # URL of your deployed Flask backend
-FLASK_BACKEND_URL = "http://localhost:5000" # IMPORTANT: Change this to your actual deployed Flask backend URL
+FLASK_BACKEND_URL = "https://jannat-backend-py.onrender.com" # IMPORTANT: Change this to your actual deployed Flask backend URL
 
 # File paths (ensure these match your Flask backend's paths for token storage if needed)
 ACCESS_TOKEN_STORAGE_FILE = "fyers_access_token.json"
