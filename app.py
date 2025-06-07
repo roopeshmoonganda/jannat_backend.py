@@ -4,7 +4,7 @@ from flask import Flask, request, jsonify
 from datetime import datetime, timedelta
 from flask_cors import CORS
 import threading 
-from jannat_algo_engine import run_stratergy
+from jannat_algo_engine import run_strategy
 
 # --- Fyers API V3 Imports ---
 # Make sure you have the latest fyers-apiv3 installed: pip install fyers-apiv3
