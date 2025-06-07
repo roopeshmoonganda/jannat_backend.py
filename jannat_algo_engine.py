@@ -4,6 +4,7 @@ import time
 from datetime import datetime, timedelta
 import requests
 import math
+from flask import Flask, jsonify, request
 import numpy as np # For numerical operations, especially for indicators
 
 # --- Configuration ---
