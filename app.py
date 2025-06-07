@@ -39,18 +39,38 @@ fyers_api_client = None
 
 
 def load_access_token():
-    """Loads the access token from a file."""
+    """
+    Loads the access token, prioritizing environment variable, then file.
+    """
+    # Try loading from environment variable first
+    env_access_token = os.environ.get("FYERS_ACCESS_TOKEN") # Changed variable name for clarity
+    if env_access_token:
+        app.logger.info("Fyers access token loaded from environment variable.")
+        return env_access_token
+
+    # Fallback to loading from file if env var is not set
     if os.path.exists(ACCESS_TOKEN_STORAGE_FILE):
-        with open(ACCESS_TOKEN_STORAGE_FILE, 'r') as f: # CORRECTED: Changed ACCESS_TOKEN_STORAGE to ACCESS_TOKEN_STORAGE_FILE
+        with open(ACCESS_TOKEN_STORAGE_FILE, 'r') as f:
             data = json.load(f)
+            app.logger.info("Fyers access token loaded from file.")
             return data.get('access_token')
     return None
 
 
 def save_access_token(token):
-    """Saves the access token to a file."""
-    with open(ACCESS_TOKEN_STORAGE_FILE, 'w') as f:
-        json.dump({'access_token': token, 'timestamp': datetime.now().isoformat()}, f)
+    """
+    Saves the access token to a file. In a production setup without persistent disk,
+    you might *not* want to save to file, but rely on manually setting ENV var.
+    For this setup, we'll keep saving to file but rely on ENV var for restarts.
+    """
+    # We still write to file, but if no persistent disk, this won't persist.
+    # The primary persistence will be the manually set FYERS_ACCESS_TOKEN environment variable.
+    try:
+        with open(ACCESS_TOKEN_STORAGE_FILE, 'w') as f:
+            json.dump({'access_token': token, 'timestamp': datetime.now().isoformat()}, f)
+            app.logger.info(f"Access token saved to {ACCESS_TOKEN_STORAGE_FILE}")
+    except IOError as e:
+        app.logger.error(f"Could not write access token to file (no persistent disk?): {e}")
 
 
 @app.before_request
@@ -68,7 +88,7 @@ def check_fyers_client_initialized():
                 app.logger.error(f"Error initializing Fyers client with stored token: {e}")
                 fyers_api_client = None # Reset if initialization fails
         else:
-            app.logger.warning("Fyers access token not found or expired. Please authenticate via /generate_auth_url.")
+            app.logger.warning("Fyers access token not found or expired. Please authenticate via /generate_auth_url or set FYERS_ACCESS_TOKEN environment variable.")
 
 
 # --- Fyers Authentication Flow ---
