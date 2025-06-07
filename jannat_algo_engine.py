@@ -627,7 +627,6 @@ def execute_strategy():
 
     if check_max_daily_losses():
         app.logger.warning(f"Max daily losses ({MAX_DAILY_LOSS_COUNT}) exceeded. Stopping algo for the day.")
-        global AUTO_MODE_ON
         AUTO_MODE_ON = False # Disable auto mode for the rest of the day
         return
 
