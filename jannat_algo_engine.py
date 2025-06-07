@@ -4,17 +4,17 @@ import time
 from datetime import datetime, timedelta
 import requests
 import math
-from flask import Flask, jsonify, request # flask is imported for logger, not for routes here
+from flask import Flask # flask is imported for logger, not for routes here
 import numpy as np # For numerical operations, especially for indicators
 
 # --- Configuration ---
 # URL of your deployed Flask backend
 # IMPORTANT: Change this to your actual deployed Flask backend URL
-FLASK_BACKEND_URL = "https://jannat-backend-py.onrender.com/" # <--- **UPDATE THIS URL**
+FLASK_BACKEND_URL = "https://jannat-backend-py.onrender.com" # <--- **UPDATE THIS URL IF NECESSARY**
 
 # File paths for persistent storage on Render's disk
 # The "PERSISTENT_DISK_PATH" environment variable will be set by Render.
-# If running locally, it defaults to the current directory.\
+# If running locally, it defaults to the current directory.
 PERSISTENT_DISK_BASE_PATH = os.environ.get("PERSISTENT_DISK_PATH", ".")
 ACCESS_TOKEN_STORAGE_FILE = os.path.join(PERSISTENT_DISK_BASE_PATH, "fyers_access_token.json")
 CAPITAL_FILE = os.path.join(PERSISTENT_DISK_BASE_PATH, "jannat_capital.json")
@@ -41,6 +41,12 @@ daily_pnl = 0.0
 total_trades = 0
 capital_data = {} # Stores current capital, daily PnL, etc.
 trade_log = [] # Stores details of executed trades
+
+# Market Hours (IST) - THESE ARE THE VARIABLES THAT WERE NOT DEFINED ERRORING
+MARKET_OPEN_TIME = datetime.strptime("09:15", "%H:%M").time()
+MARKET_CLOSE_TIME = datetime.strptime("15:30", "%H:%M").time()
+MARKET_CUTOFF_TIME = datetime.strptime("15:20", "%H:%M").time() # Stop trading before market close
+
 
 # --- Helper Functions for Persistence ---
 
