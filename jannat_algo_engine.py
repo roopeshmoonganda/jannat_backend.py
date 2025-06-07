@@ -619,7 +619,7 @@ def execute_strategy():
     This function will be called in a loop.
     """
     global current_open_trade, LAST_TRADE_DIRECTION, daily_loss_count, current_capital, daily_pnl, LAST_TRADE_TIMESTAMP
-    global AUTO_MODE_ON:
+    global AUTO_MODE_ON
 
     if not AUTO_MODE_ON:
         app.logger.info("Auto mode is OFF. Skipping strategy execution.")
