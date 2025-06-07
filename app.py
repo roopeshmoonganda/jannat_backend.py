@@ -31,7 +31,8 @@ FYERS_CLIENT_ID = os.environ.get("FYERS_CLIENT_ID", f"{FYERS_APP_ID}-100" if FYE
 
 
 # This file will store the access token generated after authentication
-ACCESS_TOKEN_STORAGE_FILE = "fyers_access_token.json"
+# Use a path on the persistent disk for deployment
+ACCESS_TOKEN_STORAGE_FILE = os.path.join(os.environ.get("PERSISTENT_DISK_PATH", "."), "fyers_access_token.json")
 
 
 # Global Fyers client instance
@@ -40,37 +41,38 @@ fyers_api_client = None
 
 def load_access_token():
     """
-    Loads the access token, prioritizing environment variable, then file.
+    Loads the access token, prioritizing environment variable, then file from persistent disk.
     """
-    # Try loading from environment variable first
-    env_access_token = os.environ.get("FYERS_ACCESS_TOKEN") # Changed variable name for clarity
+    # Try loading from environment variable first (for initial setup or quick override)
+    env_access_token = os.environ.get("FYERS_ACCESS_TOKEN")
     if env_access_token:
         app.logger.info("Fyers access token loaded from environment variable.")
         return env_access_token
 
-    # Fallback to loading from file if env var is not set
+    # Fallback to loading from file on persistent disk
     if os.path.exists(ACCESS_TOKEN_STORAGE_FILE):
-        with open(ACCESS_TOKEN_STORAGE_FILE, 'r') as f:
-            data = json.load(f)
-            app.logger.info("Fyers access token loaded from file.")
-            return data.get('access_token')
+        try:
+            with open(ACCESS_TOKEN_STORAGE_FILE, 'r') as f:
+                data = json.load(f)
+                app.logger.info("Fyers access token loaded from persistent file.")
+                return data.get('access_token')
+        except Exception as e:
+            app.logger.error(f"Error loading access token from file: {e}")
     return None
 
 
 def save_access_token(token):
     """
-    Saves the access token to a file. In a production setup without persistent disk,
-    you might *not* want to save to file, but rely on manually setting ENV var.
-    For this setup, we'll keep saving to file but rely on ENV var for restarts.
+    Saves the access token to the persistent disk.
     """
-    # We still write to file, but if no persistent disk, this won't persist.
-    # The primary persistence will be the manually set FYERS_ACCESS_TOKEN environment variable.
     try:
+        # Ensure the directory exists before writing the file
+        os.makedirs(os.path.dirname(ACCESS_TOKEN_STORAGE_FILE), exist_ok=True)
         with open(ACCESS_TOKEN_STORAGE_FILE, 'w') as f:
             json.dump({'access_token': token, 'timestamp': datetime.now().isoformat()}, f)
-            app.logger.info(f"Access token saved to {ACCESS_TOKEN_STORAGE_FILE}")
+            app.logger.info(f"Access token saved to persistent disk: {ACCESS_TOKEN_STORAGE_FILE}")
     except IOError as e:
-        app.logger.error(f"Could not write access token to file (no persistent disk?): {e}")
+        app.logger.error(f"Could not write access token to persistent disk: {e}")
 
 
 @app.before_request
