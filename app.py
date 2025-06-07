@@ -345,6 +345,14 @@ def execute_trade():
             return jsonify({"success": False, "message": f"Internal server error placing live trade: {e}"}), 500
     else:
         return jsonify({"success": False, "message": "Invalid trade mode specified."}), 400
+        @app.route('/start_algo',
+                   methods=['GET', 'POST'])
+        def start_algo():
+            try:
+                threading.Thread(target=run_stratergy).start()
+                return jsonify({"status": "Algo Started"}), 200
+            except Exception as e:
+                return jsonify({"status": "Failed to start algo", "error": str(e)}), 500
 
 
 if __name__ == "__main__":
