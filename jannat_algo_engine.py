@@ -8,12 +8,17 @@ import numpy as np # For numerical operations, especially for indicators
 
 # --- Configuration ---
 # URL of your deployed Flask backend
-FLASK_BACKEND_URL = "https://jannat-backend-py.onrender.com" # IMPORTANT: Change this to your actual deployed Flask backend URL
+# IMPORTANT: Change this to your actual deployed Flask backend URL
+FLASK_BACKEND_URL = "https://jannat-backend-py.onrender.com/" # <--- **UPDATE THIS URL**
 
-# File paths (ensure these match your Flask backend's paths for token storage if needed)
-ACCESS_TOKEN_STORAGE_FILE = "fyers_access_token.json"
-CAPITAL_FILE = "jannat_capital.json"
-TRADE_LOG_FILE = "jannat_trade_log.json"
+# File paths for persistent storage on Render's disk
+# The "PERSISTENT_DISK_PATH" environment variable will be set by Render.
+# If running locally, it defaults to the current directory.
+PERSISTENT_DISK_BASE_PATH = os.environ.get("PERSISTENT_DISK_PATH", ".")
+ACCESS_TOKEN_STORAGE_FILE = os.path.join(PERSISTENT_DISK_BASE_PATH, "fyers_access_token.json")
+CAPITAL_FILE = os.path.join(PERSISTENT_DISK_BASE_PATH, "jannat_capital.json")
+TRADE_LOG_FILE = os.path.join(PERSISTENT_DISK_BASE_PATH, "jannat_trade_log.json")
+
 
 # Trading Parameters
 BASE_CAPITAL = 100000.0 # Initial capital for paper trading
@@ -51,57 +56,86 @@ def load_capital_data():
     """Loads capital and PnL data from JSON file."""
     global current_capital, daily_pnl
     if os.path.exists(CAPITAL_FILE):
-        with open(CAPITAL_FILE, 'r') as f:
-            data = json.load(f)
-            # Check if it's a new day to reset daily PnL and trade count
-            if data.get('last_run_date') == datetime.now().strftime('%Y-%m-%d'):
-                current_capital = data.get('current_capital', BASE_CAPITAL)
-                daily_pnl = data.get('daily_pnl', 0.0)
-                app.logger.info(f"Loaded capital: {current_capital}, Daily PnL: {daily_pnl}")
-            else:
-                # New day, reset daily PnL but carry over capital
-                current_capital = data.get('current_capital', BASE_CAPITAL)
-                daily_pnl = 0.0
-                app.logger.info("New day. Resetting daily PnL.")
+        try:
+            with open(CAPITAL_FILE, 'r') as f:
+                data = json.load(f)
+                # Check for new day and reset daily PnL and loss count
+                if data.get('last_run_date') == datetime.now().strftime('%Y-%m-%d'):
+                    current_capital = data.get('current_capital', BASE_CAPITAL)
+                    daily_pnl = data.get('daily_pnl', 0.0)
+                    # daily_loss_count is not explicitly loaded here, assumes fresh start daily or managed by trade logic
+                    app.logger.info(f"Loaded capital: {current_capital}, Daily PnL: {daily_pnl} for today.")
+                else:
+                    # New day, reset daily PnL and loss count but carry over capital
+                    current_capital = data.get('current_capital', BASE_CAPITAL)
+                    daily_pnl = 0.0
+                    global daily_loss_count
+                    daily_loss_count = 0 # Reset for new day
+                    app.logger.info("New day. Resetting daily PnL and loss count.")
+        except Exception as e:
+            app.logger.error(f"Error loading capital data: {e}. Starting with base capital.")
+            current_capital = BASE_CAPITAL
+            daily_pnl = 0.0
+            daily_loss_count = 0
     else:
         app.logger.info("Capital file not found. Starting with base capital.")
+        current_capital = BASE_CAPITAL
+        daily_pnl = 0.0
+        daily_loss_count = 0
     save_capital_data() # Save to create file if not exists or update date
 
 def save_capital_data():
     """Saves current capital and daily PnL to JSON file."""
-    with open(CAPITAL_FILE, 'w') as f:
-        json.dump({
-            'current_capital': current_capital,
-            'daily_pnl': daily_pnl,
-            'last_run_date': datetime.now().strftime('%Y-%m-%d')
-        }, f)
-    app.logger.info(f"Capital saved: {current_capital}, Daily PnL: {daily_pnl}")
+    try:
+        os.makedirs(os.path.dirname(CAPITAL_FILE), exist_ok=True)
+        with open(CAPITAL_FILE, 'w') as f:
+            json.dump({
+                'current_capital': current_capital,
+                'daily_pnl': daily_pnl,
+                'last_run_date': datetime.now().strftime('%Y-%m-%d')
+            }, f, indent=4)
+        app.logger.info(f"Capital saved: {current_capital}, Daily PnL: {daily_pnl}")
+    except IOError as e:
+        app.logger.error(f"Could not write capital data to disk: {e}")
 
 def load_trade_log():
     """Loads trade log from JSON file."""
     global trades_today
     if os.path.exists(TRADE_LOG_FILE):
-        with open(TRADE_LOG_FILE, 'r') as f:
-            data = json.load(f)
-            # Only load today's trades
-            today_date = datetime.now().strftime('%Y-%m-%d')
-            trades_today = [trade for trade in data.get('trades', []) if trade.get('entry_time', '').startswith(today_date)]
-            app.logger.info(f"Loaded {len(trades_today)} trades for today.")
+        try:
+            with open(TRADE_LOG_FILE, 'r') as f:
+                data = json.load(f)
+                # Only load today's trades
+                today_date = datetime.now().strftime('%Y-%m-%d')
+                trades_today = [trade for trade in data.get('trades', []) if trade.get('entry_time', '').startswith(today_date)]
+                app.logger.info(f"Loaded {len(trades_today)} trades for today.")
+        except Exception as e:
+            app.logger.error(f"Error loading trade log: {e}. Starting with empty log.")
+            trades_today = []
     else:
         app.logger.info("Trade log file not found. Starting with empty log.")
+        trades_today = []
 
 def save_trade_log():
     """Saves all trades to JSON file."""
     # Read existing trades, merge with today's, then save
     all_trades = []
-    if os.path.exists(TRADE_LOG_FILE):
-        with open(TRADE_LOG_FILE, 'r') as f:
-            existing_data = json.load(f)
-            all_trades = [trade for trade in existing_data.get('trades', []) if not trade.get('entry_time', '').startswith(datetime.now().strftime('%Y-%m-%d'))]
-    all_trades.extend(trades_today)
-    with open(TRADE_LOG_FILE, 'w') as f:
-        json.dump({'trades': all_trades}, f, indent=4)
-    app.logger.info(f"Trade log saved with {len(all_trades)} entries.")
+    try:
+        if os.path.exists(TRADE_LOG_FILE):
+            with open(TRADE_LOG_FILE, 'r') as f:
+                existing_data = json.load(f)
+                # Filter out old trades that are not from today, then add today's trades
+                all_trades = [trade for trade in existing_data.get('trades', []) if not trade.get('entry_time', '').startswith(datetime.now().strftime('%Y-%m-%d'))]
+        
+        all_trades.extend(trades_today)
+        os.makedirs(os.path.dirname(TRADE_LOG_FILE), exist_ok=True)
+        with open(TRADE_LOG_FILE, 'w') as f:
+            json.dump({'trades': all_trades}, f, indent=4)
+        app.logger.info(f"Trade log saved with {len(all_trades)} entries.")
+    except IOError as e:
+        app.logger.error(f"Could not write trade log to disk: {e}")
+    except Exception as e:
+        app.logger.error(f"Error saving trade log: {e}")
 
 # --- Communication with Flask Backend ---
 def fetch_ohlcv_from_backend(symbol, interval, days):
@@ -181,7 +215,7 @@ def update_local_candles(symbol, interval_str, history_days, target_list):
         formatted_candles = []
         for c in new_candles:
             try:
-                # Fyers API timestamps are usually Unix timestamps (in seconds or milliseconds).
+                # Fyers API timestamps are usually Unix timestamps (in seconds).
                 # The provided code snippet suggests it might be in milliseconds, check actual API response.
                 # Assuming seconds here for now, adjust if needed.
                 dt_object = datetime.fromtimestamp(c[0])
@@ -403,8 +437,7 @@ def get_option_expiry():
     # Fyers format for expiry: YYMMMFF (e.g., 24JUN for June 2024, 246 for June 2024)
     # For weekly, it's typically YYMDD (e.g., 24606 for June 6th 2024 if it's an expiry date)
     # Or YYMMDD for NIFTY/BANKNIFTY weekly options (e.g., 24606 for June 6, 2024)
-    # Fyers symbol format often uses YYMMDDPP for specific weeklies.
-    # For BANKNIFTY/NIFTY weekly, they use YYMthDD where Month is a single char.
+    # Fyers symbol format often uses YYMNDD (Year, Month Letter for Jan-Sep/O-N-D, Day)
     # e.g., for June 7, 2025: BANKNIFTY25607 (25 for year, 6 for month, 07 for day)
     # This is highly dependent on Fyers' exact symbol convention for weekly options.
     # Let's assume YYMDD format for now, which is common for short-term options.
@@ -414,11 +447,6 @@ def get_option_expiry():
     # NSE:BANKNIFTY24613 (24 for year, 6 for June, 13 for day)
     # The common format for Bank Nifty weekly options is like 'BANKNIFTY24606' (YYMMDD)
     # For example, June 6, 2024, if it's an expiry date.
-    
-    # We will use YYMNDD for weekly expiry (YY, Month index 1-9 for Jan-Sep, 0 for Oct, N for Nov, D for Dec, Day)
-    # This is simplified and might need exact Fyers documentation cross-reference for your specific expiry date.
-    # Let's target the *next available Friday* as the expiry for simplicity.
-    # Fyers uses a compact format for weekly options in their symbol mapping, e.g., 24607 for 7th June 2024.
     
     expiry_date_str = next_friday.strftime("%y%m%d") # Format as YYMMDD
     return expiry_date_str
@@ -687,7 +715,7 @@ def execute_strategy():
             signal = None
 
         # Filter 4: Breakout Candle
-        if signal and not check_breakout_candle(latest_1min_candle, prev_1min_candle, signal):
+        if signal and (prev_1min_candle is None or not check_breakout_candle(latest_1min_candle, prev_1min_candle, signal)):
             app.logger.info(f"No breakout candle for {signal} signal. Skipping.")
             signal = None
 
@@ -821,11 +849,9 @@ def main_loop():
             app.logger.info("Market is closed or not within trading window.")
             # Reset daily counters at start of new day if not already
             if not is_market_open() and (current_time.time() > MARKET_CLOSE_TIME or current_time.time() < MARKET_OPEN_TIME):
-                if datetime.now().strftime('%Y-%m-%d') != (datetime.fromisoformat(trades_today[0]['entry_time']).strftime('%Y-%m-%d') if trades_today else ''):
-                    # It's a new day, reset daily metrics if last trade was from a previous day
-                    # This check needs to be more robust for consistent daily reset.
-                    # Best to rely on `load_capital_data`'s date check.
-                    pass # `load_capital_data` handles daily resets at startup
+                # Ensure daily PnL and trade counts reset only once per new day.
+                # The `load_capital_data` function now handles this date-based check.
+                pass 
 
         time.sleep(TRADE_INTERVAL_SECONDS) # Wait before next check
 
@@ -855,4 +881,3 @@ app.logger = SimpleLogger() # Override with simple logger for console output if 
 
 if __name__ == "__main__":
     main_loop()
-
