@@ -10,7 +10,7 @@ import numpy as np # For numerical operations, especially for indicators
 # --- Configuration ---
 # URL of your deployed Flask backend
 # IMPORTANT: Change this to your actual deployed Flask backend URL
-FLASK_BACKEND_URL = "https://jannat-backend-py.onrender.com/" # <--- **UPDATE THIS URL**
+FLASK_BACKEND_URL = "https://jannat-backend-py.onrender.com" # <--- **UPDATE THIS URL**
 
 # File paths for persistent storage on Render's disk
 # The "PERSISTENT_DISK_PATH" environment variable will be set by Render.
