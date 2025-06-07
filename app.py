@@ -41,7 +41,7 @@ fyers_api_client = None
 def load_access_token():
     """Loads the access token from a file."""
     if os.path.exists(ACCESS_TOKEN_STORAGE_FILE):
-        with open(ACCESS_TOKEN_STORAGE, 'r') as f:
+        with open(ACCESS_TOKEN_STORAGE_FILE, 'r') as f: # CORRECTED: Changed ACCESS_TOKEN_STORAGE to ACCESS_TOKEN_STORAGE_FILE
             data = json.load(f)
             return data.get('access_token')
     return None
@@ -77,7 +77,7 @@ def generate_auth_url():
     """Generates the Fyers authentication URL for manual login."""
     try:
         # V3 SessionModel for authentication using fyersModel.SessionModel
-        session = fyersModel.SessionModel( # Corrected: fyersModel.SessionModel
+        session = fyersModel.SessionModel(
             client_id=FYERS_CLIENT_ID,
             secret_key=FYERS_SECRET_ID,
             redirect_uri=FYERS_REDIRECT_URI,
@@ -101,7 +101,7 @@ def fyers_auth_callback():
 
     try:
         # V3 SessionModel for token generation using fyersModel.SessionModel
-        session = fyersModel.SessionModel( # Corrected: fyersModel.SessionModel
+        session = fyersModel.SessionModel(
             client_id=FYERS_CLIENT_ID,
             secret_key=FYERS_SECRET_ID,
             redirect_uri=FYERS_REDIRECT_URI,
