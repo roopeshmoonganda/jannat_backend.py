@@ -12,7 +12,7 @@ from fyers_apiv3 import fyersModel
 from fyers_apiv3.FyersWebsocket import data_ws # Import for data WebSocket client
 
 # --- Configuration ---
-FLASK_BACKEND_URL = os.environ.get("FLASK_BACKEND_URL", "http://localhost:5000") # Use environment variable, default to localhost for testing
+FLASK_BACKEND_URL = os.environ.get("FLASK_BACKEND_URL", "https://jannat-backend-py.onrender.com") # Use environment variable, default to localhost for testing
 
 # File paths for persistent storage on Render's disk
 PERSISTENT_DISK_BASE_PATH = os.environ.get("PERSISTENT_DISK_PATH", ".")
