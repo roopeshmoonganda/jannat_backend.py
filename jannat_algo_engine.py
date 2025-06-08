@@ -437,17 +437,17 @@ def start_fyers_websocket(access_token, client_id, symbols):
             litemode=False, # Set to True for light mode (fewer fields), False for full data
             write_to_file=False, # Set to True to write raw data to file
             reconnect=True, # Enable auto-reconnection
-            onmsg=on_ticks_callback, # Callback for incoming messages (ticks)
-            onopen=lambda: logger.info("Fyers data WebSocket connection opened."),
-            onclose=lambda: logger.info("Fyers data WebSocket connection closed."),
-            onerror=lambda e: logger.error(f"Fyers data WebSocket error: {e}")
+            # Removed onmsg, onopen, onclose, onerror from constructor
         )
+        # Assign callbacks after initialization
+        fyers_data_ws.on_message = on_ticks_callback
+        fyers_data_ws.on_open = lambda: logger.info("Fyers data WebSocket connection opened.")
+        fyers_data_ws.on_close = lambda: logger.info("Fyers data WebSocket connection closed.")
+        fyers_data_ws.on_error = lambda e: logger.error(f"Fyers data WebSocket error: {e}")
+
         fyers_data_ws.connect()
 
         # Subscribe to symbols
-        # Fyers API requires symbols in a specific format for subscription, e.g., ["NSE:BANKNIFTY-I"]
-        # Ensure your `symbols` list matches this format.
-        # For data_ws, it's typically: {"symbols": ["NSE:SYMBOL-EQ", "NSE:NIFTY24SEPFUT"]}
         subscribe_data = {
             "symbols": symbols,
             "dataType": "symbolData" # Or "candleData" if you want 1-min candles from Fyers itself
