@@ -453,12 +453,8 @@ def start_fyers_websocket(access_token, client_id, symbols):
 
         fyers_data_ws.connect()
 
-        # Subscribe to symbols
-        subscribe_data = {
-            "symbols": symbols,
-            "dataType": "symbolData" # Or "candleData" if you want 1-min candles from Fyers itself
-        }
-        fyers_data_ws.subscribe(data=subscribe_data)
+        # Subscribe to symbols - Corrected: Pass symbols and dataType directly
+        fyers_data_ws.subscribe(symbols=symbols, data_type="symbolData") 
         logger.info(f"Subscribed to Fyers WebSocket for symbols: {symbols}")
         return fyers_data_ws
     except Exception as e:
