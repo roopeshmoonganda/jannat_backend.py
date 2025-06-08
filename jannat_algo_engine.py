@@ -492,7 +492,6 @@ def start_fyers_websocket(access_token, app_logger_instance):
             on_error=on_error,       # Corrected parameter name
             on_close=on_close,       # Corrected parameter name
             on_connect=on_open,      # Corrected parameter name (used on_open function)
-            run_background=True
         )
 
         logger.info("Connecting to Fyers WebSocket...")
