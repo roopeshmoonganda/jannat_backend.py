@@ -92,25 +92,38 @@ def save_capital_data():
 def load_capital_data():
     """Loads capital data from a persistent file, or initializes if not found."""
     global jannat_capital
+    
+    # Define a default structure for jannat_capital to ensure all keys are present
+    default_capital_data = {
+        "current_balance": BASE_CAPITAL,
+        "pnl_today": 0.0,
+        "last_day_reset": datetime.now().isoformat()
+    }
+
     if os.path.exists(CAPITAL_FILE):
         try:
             with open(CAPITAL_FILE, 'r') as f:
-                jannat_capital = json.load(f)
+                loaded_data = json.load(f)
+            
+            # Merge loaded data with defaults to ensure all keys are present
+            jannat_capital = {**default_capital_data, **loaded_data}
+            
             # Check for new day reset
             last_reset_date = datetime.fromisoformat(jannat_capital.get("last_day_reset", datetime.min.isoformat())).date()
             if last_reset_date < datetime.now().date():
-                logger.info(f"New day detected. Resetting PnL from {jannat_capital['pnl_today']} to 0.")
+                # Use .get with a default for logging in case 'pnl_today' was genuinely missing before reset
+                logger.info(f"New day detected. Resetting PnL from {jannat_capital.get('pnl_today', 0.0)} to 0.")
                 jannat_capital["pnl_today"] = 0.0
                 jannat_capital["last_day_reset"] = datetime.now().isoformat()
                 save_capital_data() # Save the reset PnL
             logger.info(f"Capital data loaded: {jannat_capital}")
         except (json.JSONDecodeError, FileNotFoundError) as e:
             logger.warning(f"Error loading capital data ({e}). Initializing with base capital.")
-            jannat_capital = {"current_balance": BASE_CAPITAL, "pnl_today": 0.0, "last_day_reset": datetime.now().isoformat()}
+            jannat_capital = default_capital_data # Use default data for initialization
             save_capital_data()
     else:
         logger.info("No existing capital data found. Initializing with base capital.")
-        jannat_capital = {"current_balance": BASE_CAPITAL, "pnl_today": 0.0, "last_day_reset": datetime.now().isoformat()}
+        jannat_capital = default_capital_data # Use default data for initialization
         save_capital_data()
 
 def log_trade(trade_details):
@@ -191,7 +204,7 @@ def get_nearest_expiry_date(option_expiry_days_ahead):
 def calculate_supertrend(candles, period, multiplier):
     """Calculates Supertrend indicator."""
     if len(candles) < period:
-        return []
+        return [], [] # Return empty lists if not enough data
 
     highs = np.array([c[2] for c in candles]) # [timestamp, open, high, low, close, volume]
     lows = np.array([c[3] for c in candles])
@@ -200,8 +213,12 @@ def calculate_supertrend(candles, period, multiplier):
     # Calculate Average True Range (ATR)
     # ATR is typically max( (high-low), abs(high-prev_close), abs(low-prev_close) )
     tr = np.zeros(len(closes))
+    if len(closes) > 0: # Ensure there's data to process
+        tr[0] = highs[0] - lows[0] # First TR is just high - low
     for i in range(1, len(closes)):
         tr[i] = max(highs[i] - lows[i], abs(highs[i] - closes[i-1]), abs(lows[i] - closes[i-1]))
+    
+    # Calculate SMA of TR to get ATR (or EMA of TR for more typical ATR)
     atr = np.array([np.mean(tr[max(0, i - period + 1):i+1]) for i in range(len(tr))]) # Simple moving average of TR
 
     # Calculate Basic Upper Band and Lower Band
@@ -233,7 +250,8 @@ def calculate_supertrend(candles, period, multiplier):
                 trend[i] = 1
             else:
                 trend[i] = -1
-            supertrend[i] = ((highs[i] + lows[i]) / 2 + multiplier * atr[i]) if trend[i] == 1 else ((highs[i] + lows[i]) / 2 - multiplier * atr[i])
+            # Initial supertrend value based on initial trend direction
+            supertrend[i] = basic_lower_band[i] if trend[i] == 1 else basic_upper_band[i]
         else:
             if closes[i] > supertrend[i-1] and trend[i-1] == 1:
                 trend[i] = 1
@@ -256,7 +274,9 @@ def calculate_supertrend(candles, period, multiplier):
 
 def calculate_macd(candles, fast_period, slow_period, signal_period):
     """Calculates MACD indicator."""
-    if len(candles) < slow_period + signal_period: # Need enough data for all periods
+    # Ensure enough data for the slowest EMA and subsequent signal line EMA
+    min_required_candles = max(fast_period, slow_period) + signal_period - 1 # Adjusted for _calculate_ema
+    if len(candles) < min_required_candles:
         return [], [], []
 
     closes = np.array([c[4] for c in candles])
@@ -264,36 +284,40 @@ def calculate_macd(candles, fast_period, slow_period, signal_period):
     ema_fast = _calculate_ema(closes, fast_period)
     ema_slow = _calculate_ema(closes, slow_period)
 
-    if len(ema_fast) < len(ema_slow): # Ensure MACD calculation aligns correctly
+    # MACD Line is Fast EMA - Slow EMA.
+    # Align the EMAs correctly by taking the latter part of the longer EMA
+    # to match the length of the shorter EMA for subtraction.
+    if len(ema_fast) > len(ema_slow):
         macd_line = ema_fast[-len(ema_slow):] - ema_slow
-    elif len(ema_slow) < len(ema_fast):
+    elif len(ema_slow) > len(ema_fast):
         macd_line = ema_fast - ema_slow[-len(ema_fast):]
     else:
         macd_line = ema_fast - ema_slow
 
+    if len(macd_line) < signal_period: # Not enough MACD line points for signal line
+        return macd_line.tolist(), [], []
 
     signal_line = _calculate_ema(macd_line, signal_period)
+    
+    # Histogram is MACD Line - Signal Line.
+    # Align by taking the latter part of MACD line to match signal line length.
     histogram = macd_line[-len(signal_line):] - signal_line
 
     return macd_line.tolist(), signal_line.tolist(), histogram.tolist()
 
 def _calculate_ema(data, period):
     """Helper to calculate Exponential Moving Average (EMA)."""
-    ema_values = np.zeros_like(data, dtype=float)
-    if len(data) == 0:
-        return ema_values
+    if len(data) < period: # Not enough data for EMA
+        return np.array([])
     
-    # Initialize EMA with SMA for the first 'period' values
-    if len(data) >= period:
-        ema_values[period - 1] = np.mean(data[:period])
-        multiplier = 2 / (period + 1)
-        for i in range(period, len(data)):
-            ema_values[i] = ((data[i] - ema_values[i-1]) * multiplier) + ema_values[i-1]
-    else:
-        # If data is less than period, a simple average or just the data itself
-        # is sometimes used, or EMA calculation might be skipped.
-        # For simplicity here, if not enough data, just return zeros or partial.
-        pass 
+    ema_values = np.zeros_like(data, dtype=float)
+    
+    # Simple Moving Average for the first 'period' values to initialize EMA
+    ema_values[period - 1] = np.mean(data[:period])
+    multiplier = 2 / (period + 1)
+    
+    for i in range(period, len(data)):
+        ema_values[i] = ((data[i] - ema_values[i-1]) * multiplier) + ema_values[i-1]
 
     return ema_values[period-1:] # Return from the point where EMA truly starts
 
@@ -350,14 +374,10 @@ def build_candle_from_ticks(symbol):
     # Calculate offset from market open to align candle start times
     # This logic assumes candles align to fixed intervals from market open
     # E.g., if market opens at 9:15 and candle is 5 min, candles will be 9:15-9:20, 9:20-9:25 etc.
-    if current_time.hour < market_open_hour or \
-       (current_time.hour == market_open_hour and current_time.minute < market_open_minute):
-        # Market not open yet or before open time for candle alignment
-        return
-
-    # Calculate elapsed seconds since market open today
     market_open_today = current_time.replace(hour=market_open_hour, minute=market_open_minute, second=0, microsecond=0)
-    if current_time < market_open_today: # Handles cases where current_time might be before market open
+    
+    # Ensure we are past market open before attempting to build candles
+    if current_time < market_open_today:
         return
 
     elapsed_seconds = (current_time - market_open_today).total_seconds()
@@ -372,35 +392,29 @@ def build_candle_from_ticks(symbol):
     # Iterate through ticks, removing those that are too old (belong to previous completed candles)
     # and using them to build a candle if an interval closes.
     
-    # Logic to build and finalize a candle when its interval ends:
-    
     # Keep track of ticks for the *current* incomplete candle
-    current_candle_ticks = []
+    # Temporarily hold ticks for the current interval
+    temp_current_candle_ticks = deque()
     
+    # Move ticks that belong to the current or future candle into a temporary deque
+    # and remove any ticks that are older than the current candle's start time.
     while ticks_for_symbol and ticks_for_symbol[0][0] < current_candle_start_time:
-        # This tick belongs to a *previous* candle interval that should have been closed.
-        # This scenario happens if `build_candle_from_ticks` wasn't called precisely
-        # at the candle close time, or if ticks arrived out of order/delayed.
-        # For robustness, we might need a more sophisticated candle builder that
-        # handles multiple past candle intervals.
-        # For now, we'll just discard these and process the first tick that's >= current_candle_start_time
-        # or handle them when they become part of a *completed* interval.
-        ticks_for_symbol.popleft() # Discard old tick
-        
-    # Collect ticks for the *current* candle interval
+        ticks_for_symbol.popleft() # Discard old ticks
+
     while ticks_for_symbol and ticks_for_symbol[0][0] < current_candle_end_time:
-        current_candle_ticks.append(ticks_for_symbol.popleft())
-
+        temp_current_candle_ticks.append(ticks_for_symbol.popleft())
+    
     # If the current candle interval has ended AND we have ticks for it, finalize it
-    if current_time >= current_candle_end_time and current_candle_ticks:
+    if current_time >= current_candle_end_time and temp_current_candle_ticks:
         # Sort ticks by time to ensure O, H, L, C are correct if ticks arrive out of order
-        current_candle_ticks.sort(key=lambda x: x[0])
+        # Convert deque to list for sorting, then back if needed, or process directly
+        sorted_ticks = sorted(list(temp_current_candle_ticks), key=lambda x: x[0])
 
-        open_price = current_candle_ticks[0][1]
-        close_price = current_candle_ticks[-1][1]
-        high_price = max(t[1] for t in current_candle_ticks)
-        low_price = min(t[1] for t in current_candle_ticks)
-        volume = len(current_candle_ticks) # Simple tick count as volume for now
+        open_price = sorted_ticks[0][1]
+        close_price = sorted_ticks[-1][1]
+        high_price = max(t[1] for t in sorted_ticks)
+        low_price = min(t[1] for t in sorted_ticks)
+        volume = len(sorted_ticks) # Simple tick count as volume for now
 
         # Fyers API historical data format: [timestamp, open, high, low, close, volume]
         # Timestamp for the candle usually represents the start time of the candle interval
@@ -410,49 +424,8 @@ def build_candle_from_ticks(symbol):
         logger.info(f"New {CANDLE_RESOLUTION_SECONDS/60}-min candle for {symbol}: {new_candle}")
         # At this point, you could trigger your strategy functions with this new candle data.
 
-    # If we are past the end of the current candle, and new ticks arrive,
-    # it means a new candle interval has begun. The `ticks_for_symbol` deque
-    # will naturally start accumulating for the next candle.
-
-    # Note: This is a simplified candle builder. A production-grade one would need:
-    # 1. More robust handling of late/out-of-order ticks.
-    # 2. Proper volume aggregation (if tick data includes size).
-    # 3. Handling of gaps (no ticks for an interval).
-    # 4. Potentially storing a history of recent candles (e.g., last 20-50 candles).
-
-
-def start_fyers_websocket(access_token, client_id, symbols_to_subscribe):
-    """Initializes and starts the Fyers WebSocket for data."""
-    global logger
-    
-    if not access_token:
-        logger.error("Fyers access token not available for WebSocket connection.")
-        return None
-
-    # Fyers Websocket needs client_id, access_token
-    # client_id should be APP_ID-100 or similar
-    # logger should be a proper logging object
-    fyers_data_ws = data_ws.FyersSocket(
-        access_token=f"{client_id}:{access_token}", # Fyers expects this format
-        log_path=os.getcwd(), # Path for WebSocket logs
-        litemode=False, # Set to False for full tick data
-        write_to_file=False,
-        reconnect=True,
-        on_connect=lambda: logger.info("Fyers WebSocket connected."),
-        on_close=lambda: logger.info("Fyers WebSocket closed."),
-        on_error=lambda msg: logger.error(f"Fyers WebSocket error: {msg}"),
-        on_ticks=on_ticks_callback # Our custom tick handler
-    )
-
-    fyers_data_ws.connect()
-
-    # Subscribe to symbols
-    data_type = "TickByTick" # Or "CandleData" if you want server-side candles
-    symbols_for_sub = [{"symbol": s, "dataType": data_type} for s in symbols_to_subscribe]
-    fyers_data_ws.subscribe(data_type=data_type, symbols=symbols_for_sub)
-    logger.info(f"Subscribed to {data_type} for symbols: {symbols_to_subscribe}")
-
-    return fyers_data_ws
+    # Any remaining ticks in `ticks_for_symbol` are for the *next* candle interval.
+    # These will be processed in subsequent calls to `build_candle_from_ticks`.
 
 
 # --- Trade Management Functions ---
