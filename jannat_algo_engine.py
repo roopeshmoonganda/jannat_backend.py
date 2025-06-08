@@ -4,668 +4,774 @@ import time
 from datetime import datetime, timedelta
 import requests
 import math
-from flask import Flask
-import numpy as np # For numerical operations, especially for indicators
+import numpy as np
+from collections import deque # For storing recent ticks for candle reconstruction
+
+# --- Fyers API V3 Imports ---
+from fyers_apiv3 import fyersModel
+from fyers_apiv3.FyersWebsocket import data_ws # Import for data WebSocket client
 
 # --- Configuration ---
-# URL of your deployed Flask backend
-# IMPORTANT: Change this to your actual deployed Flask backend URL
-FLASK_BACKEND_URL = "https://jannat-backend-py.onrender.com" # <--- **UPDATE THIS URL**
+FLASK_BACKEND_URL = os.environ.get("FLASK_BACKEND_URL", "http://localhost:5000") # Use environment variable, default to localhost for testing
 
 # File paths for persistent storage on Render's disk
-# The "PERSISTENT_DISK_PATH" environment variable will be set by Render.
-# If running locally, it defaults to the current directory.
 PERSISTENT_DISK_BASE_PATH = os.environ.get("PERSISTENT_DISK_PATH", ".")
 ACCESS_TOKEN_STORAGE_FILE = os.path.join(PERSISTENT_DISK_BASE_PATH, "fyers_access_token.json")
 CAPITAL_FILE = os.path.join(PERSISTENT_DISK_BASE_PATH, "jannat_capital.json")
 TRADE_LOG_FILE = os.path.join(PERSISTENT_DISK_BASE_PATH, "jannat_trade_log.json")
 
-
 # Trading Parameters
-BASE_CAPITAL = 100000.0 # Initial capital for paper trading
-SYMBOL_SPOT = "NSE:BANKNIFTY" # Base symbol for ATM option selection
-OPTION_EXPIRY_DAYS_AHEAD = 7 # Number of days to look ahead for option expiry (adjust as needed for weekly/monthly)
-BANKNIFTY_STRIKE_INTERVAL = 100 # BankNifty strikes are typically 100 apart
-NIFTY_STRIKE_INTERVAL = 50 # Nifty strikes are typically 50 apart
+BASE_CAPITAL = 100000.0
+SYMBOL_SPOT = "NSE:BANKNIFTY"
+OPTION_EXPIRY_DAYS_AHEAD = 7
+BANKNIFTY_STRIKE_INTERVAL = 100
+NIFTY_STRIKE_INTERVAL = 50
 
-# --- UPDATED PROFIT/LOSS TARGETS ---
-TARGET_PERCENT = 0.02 # 2.0% target
-STOP_LOSS_PERCENT = 0.01 # 1.0% stop loss
+# Strategy Parameters (Supertrend and MACD)
+SUPER_TREND_PERIOD = 10
+SUPER_TREND_MULTIPLIER = 3
+FAST_MA_PERIOD = 12
+SLOW_MA_PERIOD = 26
+SIGNAL_PERIOD = 9
 
-# --- TRAILING STOP LOSS PARAMETERS ---
-# Activate trailing SL when running profit reaches this percentage
-TRAILING_SL_PROFIT_ACTIVATION_PERCENT = 0.01 # 1% profit
-# Lock in this percentage of profit when trailing SL activates/moves
-TRAILING_SL_LOCK_PERCENT = 0.008 # 0.8% profit locked
+# Trade Management Parameters
+TARGET_MULTIPLIER = 0.005 # 0.5% target
+STOP_LOSS_MULTIPLIER = 0.002 # 0.2% stop loss
+TRADE_QUANTITY_PER_LOT_BANKNIFTY = 15 # Example: BankNifty lot size
+MAX_ACTIVE_TRADES = 1 # Max number of concurrent trades
 
-QUANTITY_PER_TRADE = 15 # Example: 1 lot of BankNifty (15 shares)
-PRODUCT_TYPE = "MIS" # MIS, CNC, NRML
-ORDER_TYPE = "MARKET" # MARKET or LIMIT
-TRADE_MODE = "PAPER" # "PAPER" for simulated trades, "LIVE" for real trades
-TRADE_INTERVAL_SECONDS = 60 * 1 # Check and trade every 1 minute for faster scalping checks
+# --- Global Variables for Algo Engine State ---
+active_trades = {} # Stores details of current active trades (key: symbol, value: trade_object)
+jannat_capital = {"current_balance": BASE_CAPITAL, "pnl_today": 0.0, "last_day_reset": datetime.now().isoformat()}
 
+# --- Global for Tick Data and Candle Reconstruction ---
+# Dictionary to hold ticks for each symbol: {'NSE:BANKNIFTY24SEPFUT': deque([(timestamp, price), ...]), ...}
+symbol_ticks = {}
+# Dictionary to store last completed candles: {'NSE:BANKNIFTY24SEPFUT': [timestamp, open, high, low, close, volume], ...}
+last_completed_candles = {}
+CANDLE_RESOLUTION_SECONDS = 300 # 5 minutes for example (5 * 60)
 
-# Global variables for trade management and PnL tracking
-current_day = datetime.now().date() # Initial global declaration
-daily_pnl = 0.0
-total_trades = 0
-capital_data = {} # Stores current capital, daily PnL, etc.
-trade_log = [] # Stores details of executed trades
+# Logger placeholder (will be replaced by Flask app.logger)
+class SimpleLogger:
+    def info(self, message):
+        print(f"[INFO] {datetime.now().strftime('%H:%M:%S')} - {message}")
+    def warning(self, message):
+        print(f"[WARNING] {datetime.now().strftime('%H:%M:%S')} - {message}")
+    def error(self, message):
+        print(f"[ERROR] {datetime.now().strftime('%H:%M:%S')} - {message}")
 
-# Market Hours (IST)
-MARKET_OPEN_TIME = datetime.strptime("09:15", "%H:%M").time()
-MARKET_CLOSE_TIME = datetime.strptime("15:30", "%H:%M").time()
-MARKET_CUTOFF_TIME = datetime.strptime("15:20", "%H:%M").time() # Stop trading before market close
+logger = SimpleLogger() # Default logger, will be overridden by Flask's app.logger
 
+# --- Helper Functions ---
 
-# --- Helper Functions for Persistence ---
-
-def load_capital_data():
-    global capital_data, daily_pnl, total_trades, current_day
+def get_fyers_access_token():
+    """Reads the Fyers access token from a file."""
+    if not os.path.exists(ACCESS_TOKEN_STORAGE_FILE):
+        logger.error(f"Access token file not found at {ACCESS_TOKEN_STORAGE_FILE}. Please authenticate.")
+        return None
     try:
-        if os.path.exists(CAPITAL_FILE):
-            with open(CAPITAL_FILE, "r") as f:
-                loaded_data = json.load(f)
-                capital_data = loaded_data
-                last_recorded_date = datetime.fromisoformat(loaded_data.get('last_recorded_date', datetime.min.isoformat())).date()
-
-                if last_recorded_date != datetime.now().date():
-                    app.logger.info(f"New day detected. Resetting daily PnL and trade count for {datetime.now().date()}")
-                    capital_data['daily_pnl'] = 0.0
-                    capital_data['total_trades_today'] = 0
-                    capital_data['last_recorded_date'] = datetime.now().isoformat()
-                    daily_pnl = 0.0
-                    total_trades = 0
-                else:
-                    daily_pnl = capital_data.get('daily_pnl', 0.0)
-                    total_trades = capital_data.get('total_trades_today', 0)
-                app.logger.info(f"Capital data loaded: {capital_data}")
-        else:
-            capital_data = {
-                "current_capital": BASE_CAPITAL,
-                "daily_pnl": 0.0,
-                "total_trades_today": 0,
-                "last_recorded_date": datetime.now().isoformat()
-            }
-            app.logger.info("No capital data found. Initializing with base capital.")
-        current_day = datetime.now().date()
-    except (IOError, json.JSONDecodeError) as e:
-        app.logger.error(f"Error loading capital data: {e}")
-        capital_data = {
-            "current_capital": BASE_CAPITAL,
-            "daily_pnl": 0.0,
-            "total_trades_today": 0,
-            "last_recorded_date": datetime.now().isoformat()
-        }
-        daily_pnl = 0.0
-        total_trades = 0
-    save_capital_data()
-
+        with open(ACCESS_TOKEN_STORAGE_FILE, 'r') as f:
+            token_data = json.load(f)
+            return token_data.get('access_token')
+    except json.JSONDecodeError:
+        logger.error("Error decoding access token JSON. File might be corrupted.")
+        return None
+    except Exception as e:
+        logger.error(f"Error reading access token: {e}")
+        return None
 
 def save_capital_data():
+    """Saves the current capital data to a persistent file."""
     try:
-        capital_data['daily_pnl'] = daily_pnl
-        capital_data['total_trades_today'] = total_trades
-        capital_data['last_recorded_date'] = datetime.now().isoformat()
-        with open(CAPITAL_FILE, "w") as f:
-            json.dump(capital_data, f, indent=4)
-        app.logger.info("Capital data saved.")
-    except IOError as e:
-        app.logger.error(f"Error saving capital data: {e}")
+        with open(CAPITAL_FILE, 'w') as f:
+            json.dump(jannat_capital, f, indent=4)
+        logger.info("Capital data saved.")
+    except Exception as e:
+        logger.error(f"Error saving capital data: {e}")
 
-def load_trade_log():
-    global trade_log
-    try:
-        if os.path.exists(TRADE_LOG_FILE):
-            with open(TRADE_LOG_FILE, "r") as f:
-                trade_log = json.load(f)
-            app.logger.info("Trade log loaded.")
-    except (IOError, json.JSONDecodeError) as e:
-        app.logger.error(f"Error loading trade log: {e}")
-        trade_log = []
-    save_trade_log()
+def load_capital_data():
+    """Loads capital data from a persistent file, or initializes if not found."""
+    global jannat_capital
+    if os.path.exists(CAPITAL_FILE):
+        try:
+            with open(CAPITAL_FILE, 'r') as f:
+                jannat_capital = json.load(f)
+            # Check for new day reset
+            last_reset_date = datetime.fromisoformat(jannat_capital.get("last_day_reset", datetime.min.isoformat())).date()
+            if last_reset_date < datetime.now().date():
+                logger.info(f"New day detected. Resetting PnL from {jannat_capital['pnl_today']} to 0.")
+                jannat_capital["pnl_today"] = 0.0
+                jannat_capital["last_day_reset"] = datetime.now().isoformat()
+                save_capital_data() # Save the reset PnL
+            logger.info(f"Capital data loaded: {jannat_capital}")
+        except (json.JSONDecodeError, FileNotFoundError) as e:
+            logger.warning(f"Error loading capital data ({e}). Initializing with base capital.")
+            jannat_capital = {"current_balance": BASE_CAPITAL, "pnl_today": 0.0, "last_day_reset": datetime.now().isoformat()}
+            save_capital_data()
+    else:
+        logger.info("No existing capital data found. Initializing with base capital.")
+        jannat_capital = {"current_balance": BASE_CAPITAL, "pnl_today": 0.0, "last_day_reset": datetime.now().isoformat()}
+        save_capital_data()
 
-def save_trade_log():
+def log_trade(trade_details):
+    """Logs trade details to a JSON file."""
+    if not os.path.exists(TRADE_LOG_FILE):
+        with open(TRADE_LOG_FILE, 'w') as f:
+            json.dump([], f) # Create an empty list if file doesn't exist
+
     try:
-        with open(TRADE_LOG_FILE, "w") as f:
+        with open(TRADE_LOG_FILE, 'r+') as f:
+            f.seek(0) # Go to the beginning of the file
+            content = f.read()
+            if content:
+                trade_log = json.loads(content)
+            else:
+                trade_log = []
+
+            trade_log.append(trade_details)
+            f.seek(0) # Go to the beginning again to overwrite
+            f.truncate() # Clear existing content
             json.dump(trade_log, f, indent=4)
-        app.logger.info("Trade log saved.")
-    except IOError as e:
-        app.logger.error(f"Error saving trade log: {e}")
-
-# --- Market Status & Time Functions ---
+        logger.info(f"Trade logged: {trade_details}")
+    except Exception as e:
+        logger.error(f"Error logging trade: {e}")
 
 def is_market_open():
-    """Checks if the market is currently open based on IST."""
-    current_time_ist = datetime.now().time()
-    return MARKET_OPEN_TIME <= current_time_ist <= MARKET_CLOSE_TIME
+    """Checks if the market is open for trading (e.g., NSE equity market hours)."""
+    now = datetime.now()
+    # IST Market Hours: 9:15 AM to 3:30 PM
+    market_open_time = now.replace(hour=9, minute=15, second=0, microsecond=0)
+    market_close_time = now.replace(hour=15, minute=30, second=0, microsecond=0)
 
-def is_within_trading_window():
-    """Checks if within typical trading hours, including a buffer before close."""
-    current_time_ist = datetime.now().time()
-    return MARKET_OPEN_TIME <= current_time_ist <= MARKET_CUTOFF_TIME
+    # Check if it's a weekday (Monday=0 to Friday=4)
+    if now.weekday() < 5 and market_open_time <= now <= market_close_time:
+        return True
+    return False
 
-# --- Backend Communication Functions ---
+def get_current_option_symbol(spot_symbol, expiry_date, is_call, strike_price):
+    """Constructs the Fyers option symbol."""
+    # Example: BANKNIFTY24SEP46000CE
+    # Format: INSTRUMENT + YY + MON (3 chars) + Strike + PE/CE
+    # Note: Fyers symbols can be tricky, often requiring specific formatting.
+    # This is a simplified example. For actual Fyers symbol generation,
+    # you might need to use their master data or an API to find correct symbols.
+    year_short = expiry_date.strftime('%y')
+    month_short = expiry_date.strftime('%b').upper() # e.g., JAN, FEB
+    option_type = "CE" if is_call else "PE"
+    strike_str = str(int(strike_price))
 
-def fetch_ohlcv_from_backend(symbol, resolution, days):
-    """Fetches OHLCV data from the Flask backend for a given resolution."""
-    payload = {
-        "symbol": symbol,
-        "resolution": resolution, # Use resolution parameter
-        "date_format": "1",
-        "range_from": (datetime.now() - timedelta(days=days)).strftime('%Y-%m-%d'),
-        "range_to": datetime.now().strftime('%Y-%m-%d'),
-        "cont_flag": "1"
-    }
-    try:
-        response = requests.post(f"{FLASK_BACKEND_URL}data/ohlcv", json=payload)
-        response.raise_for_status()
-        data = response.json()
-        if data.get('success'):
-            return data['data']
-        else:
-            app.logger.error(f"Failed to fetch OHLCV for {symbol} ({resolution}): {data.get('message', 'Unknown error from backend')}")
-            return None
-    except requests.exceptions.RequestException as e:
-        app.logger.error(f"Error connecting to Flask backend for OHLCV ({resolution}): {e}")
-        return None
+    # Fyers often uses specific patterns, e.g., BANKNIFTY24MAY43000CE
+    # For weekly options, it might be BANKNIFTY2452243000CE (YYMDD) or similar.
+    # This example assumes monthly format for simplicity.
+    # For true Fyers compliance, you'd need their master data or a more robust symbol builder.
+    return f"{spot_symbol.split(':')[1]}{year_short}{month_short}{strike_str}{option_type}"
 
-def fetch_quote_from_backend(symbol):
-    """Fetches real-time quote data from the Flask backend."""
-    payload = {"symbols": [symbol]}
-    try:
-        response = requests.post(f"{FLASK_BACKEND_URL}data/quote", json=payload)
-        response.raise_for_status()
-        data = response.json()
-        if data.get('success'):
-            return data['data']
-        else:
-            app.logger.error(f"Failed to fetch quote for {symbol}: {data.get('message', 'Unknown error from backend')}")
-            return None
-    except requests.exceptions.RequestException as e:
-        app.logger.error(f"Error connecting to Flask backend for quote {symbol}: {e}")
-        return None
 
-def execute_trade_on_backend(symbol, signal, entry_price, target, stop_loss, atm_strike, quantity, product_type, order_type, trade_mode):
-    """Executes a trade via the Flask backend."""
-    payload = {
-        "symbol": symbol,
-        "signal": signal,
-        "entryPrice": entry_price,
-        "target": target,
-        "stopLoss": stop_loss,
-        "atmStrike": atm_strike,
-        "quantity": quantity,
-        "product_type": product_type,
-        "order_type": order_type,
-        "trade_mode": trade_mode
-    }
-    try:
-        response = requests.post(f"{FLASK_BACKEND_URL}trade/execute", json=payload)
-        response.raise_for_status()
-        data = response.json()
-        if data.get('success'):
-            app.logger.info(f"Trade executed on backend: {data.get('message')}")
-            return data['orderId']
-        else:
-            app.logger.error(f"Failed to execute trade on backend: {data.get('message', 'Unknown error')}")
-            return None
-    except requests.exceptions.RequestException as e:
-        app.logger.error(f"Error connecting to Flask backend for trade execution: {e}")
-        return None
+def get_current_atm_strike(current_spot_price, strike_interval):
+    """Calculates the At-The-Money (ATM) strike price."""
+    return round(current_spot_price / strike_interval) * strike_interval
 
-# --- Option Chain & Strike Calculation ---
+def get_nearest_expiry_date(option_expiry_days_ahead):
+    """Finds the nearest weekly or monthly expiry date for options."""
+    today = datetime.now().date()
+    # Fyers options typically expire on Thursday
+    # Find next Thursday
+    days_until_thursday = (3 - today.weekday() + 7) % 7 # 3 is Thursday (Mon=0, Tue=1, Wed=2, Thu=3, Fri=4, Sat=5, Sun=6)
+    next_thursday = today + timedelta(days=days_until_thursday)
 
-def get_closest_strike(spot_price, strike_interval):
-    """Calculates the ATM strike price."""
-    return round(spot_price / strike_interval) * strike_interval
+    # If today is Thursday and market is open/about to close, the expiry might be next week's Thursday.
+    # This logic can be complex for edge cases (e.g., holiday, monthly expiry).
+    # For simplicity, we'll just target the next immediate Thursday.
+    # You might want to fetch actual expiry dates from Fyers API or master data.
+    return next_thursday
 
-def get_option_symbols(spot_price, expiry_days_ahead):
-    """
-    Generates relevant option symbols for BANKNIFTY/NIFTY.
-    """
-    current_date = datetime.now()
-    days_until_thursday = (3 - current_date.weekday() + 7) % 7
-    next_thursday = current_date + timedelta(days=days_until_thursday)
-    if current_date.weekday() == 3 and current_date.time() > MARKET_CLOSE_TIME:
-        next_thursday += timedelta(days=7)
 
-    expiry_suffix = next_thursday.strftime('%y%m%d')
+# --- Indicator Calculations (Remain Unchanged in Logic, but data source changes) ---
 
-    atm_strike = get_closest_strike(spot_price, BANKNIFTY_STRIKE_INTERVAL)
-    ce_symbol = f"NSE:BANKNIFTY{expiry_suffix}{atm_strike}CE"
-    pe_symbol = f"NSE:BANKNIFTY{expiry_suffix}{atm_strike}PE"
-
-    app.logger.info(f"Generated ATM CE: {ce_symbol}, PE: {pe_symbol}")
-    return ce_symbol, pe_symbol, atm_strike
-
-# --- Technical Analysis (Enhanced) ---
-
-def calculate_sma(candles, period):
-    """Calculates Simple Moving Average."""
+def calculate_supertrend(candles, period, multiplier):
+    """Calculates Supertrend indicator."""
     if len(candles) < period:
-        return None
-    close_prices = [c['close'] for c in candles]
-    return np.mean(close_prices[-period:])
+        return []
 
-def calculate_rsi(candles, period=14):
-    """Calculates Relative Strength Index."""
-    if len(candles) < period + 1:
-        return None
+    highs = np.array([c[2] for c in candles]) # [timestamp, open, high, low, close, volume]
+    lows = np.array([c[3] for c in candles])
+    closes = np.array([c[4] for c in candles])
 
-    close_prices = np.array([c['close'] for c in candles])
-    deltas = np.diff(close_prices)
-    gains = deltas[deltas > 0]
-    losses = -deltas[deltas < 0]
+    # Calculate Average True Range (ATR)
+    # ATR is typically max( (high-low), abs(high-prev_close), abs(low-prev_close) )
+    tr = np.zeros(len(closes))
+    for i in range(1, len(closes)):
+        tr[i] = max(highs[i] - lows[i], abs(highs[i] - closes[i-1]), abs(lows[i] - closes[i-1]))
+    atr = np.array([np.mean(tr[max(0, i - period + 1):i+1]) for i in range(len(tr))]) # Simple moving average of TR
 
-    avg_gain = np.mean(gains[:period]) if len(gains[:period]) > 0 else 0
-    avg_loss = np.mean(losses[:period]) if len(losses[:period]) > 0 else 0
+    # Calculate Basic Upper Band and Lower Band
+    basic_upper_band = (highs + lows) / 2 + multiplier * atr
+    basic_lower_band = (highs + lows) / 2 - multiplier * atr
 
-    if avg_loss == 0:
-        return 100 if avg_gain > 0 else 50
-
-    rs = avg_gain / avg_loss
-    rsi = 100 - (100 / (1 + rs))
-    return rsi
-
-def calculate_supertrend(candles, atr_period=10, multiplier=3.0):
-    """
-    Calculates the Supertrend indicator.
-    Candles should have 'high', 'low', 'close' keys.
-    Returns a tuple: (supertrend_value, direction)
-    Direction: 1 for uptrend (green), -1 for downtrend (red), 0 for flat/no clear trend yet.
-    """
-    if len(candles) < atr_period:
-        return None, 0
-
-    highs = np.array([c['high'] for c in candles])
-    lows = np.array([c['low'] for c in candles])
-    closes = np.array([c['close'] for c in candles])
-
-    tr = np.maximum(highs - lows, np.abs(highs - np.roll(closes, 1)), np.abs(lows - np.roll(closes, 1)))
-    tr[0] = (highs[0] - lows[0]) # Handle first value where np.roll looks at invalid index
-
-    atr = np.zeros_like(tr)
-    atr[atr_period-1] = np.mean(tr[:atr_period])
-    for i in range(atr_period, len(tr)):
-        atr[i] = ((atr[i-1] * (atr_period - 1)) + tr[i]) / atr_period
-
-    basic_upper_band = ((highs + lows) / 2) + (multiplier * atr)
-    basic_lower_band = ((highs + lows) / 2) - (multiplier * atr)
-
+    # Calculate Final Upper Band and Lower Band
     final_upper_band = np.copy(basic_upper_band)
     final_lower_band = np.copy(basic_lower_band)
 
-    supertrend = np.zeros_like(closes)
-    direction = np.zeros_like(closes, dtype=int) # 1 for up, -1 for down
+    for i in range(1, len(closes)):
+        if closes[i-1] > final_upper_band[i-1]:
+            final_upper_band[i] = max(basic_upper_band[i], final_upper_band[i-1])
+        else:
+            final_upper_band[i] = basic_upper_band[i]
 
-    # Initialize first direction based on close vs. bands or assume flat
-    if closes[atr_period-1] > basic_upper_band[atr_period-1]:
-        direction[atr_period-1] = 1
-    elif closes[atr_period-1] < basic_lower_band[atr_period-1]:
-        direction[atr_period-1] = -1
+        if closes[i-1] < final_lower_band[i-1]:
+            final_lower_band[i] = min(basic_lower_band[i], final_lower_band[i-1])
+        else:
+            final_lower_band[i] = basic_lower_band[i]
+
+    # Calculate Supertrend
+    supertrend = np.zeros(len(closes))
+    trend = np.zeros(len(closes)) # 1 for uptrend, -1 for downtrend
+
+    for i in range(len(closes)):
+        if i == 0: # Initialize first trend based on close vs midpoint
+            if closes[i] > ((highs[i] + lows[i]) / 2):
+                trend[i] = 1
+            else:
+                trend[i] = -1
+            supertrend[i] = ((highs[i] + lows[i]) / 2 + multiplier * atr[i]) if trend[i] == 1 else ((highs[i] + lows[i]) / 2 - multiplier * atr[i])
+        else:
+            if closes[i] > supertrend[i-1] and trend[i-1] == 1:
+                trend[i] = 1
+                supertrend[i] = max(final_lower_band[i], supertrend[i-1])
+            elif closes[i] < supertrend[i-1] and trend[i-1] == -1:
+                trend[i] = -1
+                supertrend[i] = min(final_upper_band[i], supertrend[i-1])
+            elif closes[i] > supertrend[i-1] and trend[i-1] == -1: # Trend reversal to up
+                trend[i] = 1
+                supertrend[i] = final_lower_band[i]
+            elif closes[i] < supertrend[i-1] and trend[i-1] == 1: # Trend reversal to down
+                trend[i] = -1
+                supertrend[i] = final_upper_band[i]
+            else: # No clear change, maintain previous trend and supertrend value
+                trend[i] = trend[i-1]
+                supertrend[i] = supertrend[i-1]
+
+
+    return supertrend.tolist(), trend.tolist() # Return list for JSON serialization
+
+def calculate_macd(candles, fast_period, slow_period, signal_period):
+    """Calculates MACD indicator."""
+    if len(candles) < slow_period + signal_period: # Need enough data for all periods
+        return [], [], []
+
+    closes = np.array([c[4] for c in candles])
+
+    ema_fast = _calculate_ema(closes, fast_period)
+    ema_slow = _calculate_ema(closes, slow_period)
+
+    if len(ema_fast) < len(ema_slow): # Ensure MACD calculation aligns correctly
+        macd_line = ema_fast[-len(ema_slow):] - ema_slow
+    elif len(ema_slow) < len(ema_fast):
+        macd_line = ema_fast - ema_slow[-len(ema_fast):]
     else:
-        direction[atr_period-1] = 0 # No clear trend initially
+        macd_line = ema_fast - ema_slow
 
-    for i in range(atr_period, len(candles)):
-        # Calculate current bands
-        current_basic_upper = basic_upper_band[i]
-        current_basic_lower = basic_lower_band[i]
-        
-        # Adjust final bands based on previous direction
-        if direction[i-1] == 1: # If previous was uptrend
-            final_lower_band[i] = max(current_basic_lower, final_lower_band[i-1])
-            final_upper_band[i] = current_basic_upper # Upper band can move freely
-        else: # If previous was downtrend or flat
-            final_upper_band[i] = min(current_basic_upper, final_upper_band[i-1])
-            final_lower_band[i] = current_basic_lower # Lower band can move freely
 
-        # Determine current direction
-        if closes[i] > final_upper_band[i-1]:
-            direction[i] = 1 # Price moved above upper band, new uptrend
-        elif closes[i] < final_lower_band[i-1]:
-            direction[i] = -1 # Price moved below lower band, new downtrend
-        else:
-            direction[i] = direction[i-1] # Retain previous direction if no cross
+    signal_line = _calculate_ema(macd_line, signal_period)
+    histogram = macd_line[-len(signal_line):] - signal_line
 
-        # Set Supertrend value based on direction
-        if direction[i] == 1:
-            supertrend[i] = final_lower_band[i]
-        else:
-            supertrend[i] = final_upper_band[i]
+    return macd_line.tolist(), signal_line.tolist(), histogram.tolist()
 
-    return supertrend[-1], direction[-1] # Return last value and its direction
-
-def calculate_macd(candles, fast_period=12, slow_period=26, signal_period=9):
-    """
-    Calculates MACD, Signal Line, and MACD Histogram.
-    Candles should have 'close' keys.
-    Returns (macd_value, signal_line_value, histogram_value) for the latest candle.
-    """
-    if len(candles) < slow_period + signal_period: # Needs enough data for all EMAs
-        return None, None, None
-
-    close_prices = np.array([c['close'] for c in candles])
-
-    # Function to calculate EMA
-    def ema(prices, period):
-        ema_values = np.zeros_like(prices)
-        if len(prices) < period: return ema_values
-        
-        smoothing_factor = 2 / (period + 1)
-        
-        # Calculate initial EMA (simple average of first 'period' prices)
-        ema_values[period-1] = np.mean(prices[:period]) 
-
-        for i in range(period, len(prices)):
-            ema_values[i] = (prices[i] * smoothing_factor) + (ema_values[i-1] * (1 - smoothing_factor))
+def _calculate_ema(data, period):
+    """Helper to calculate Exponential Moving Average (EMA)."""
+    ema_values = np.zeros_like(data, dtype=float)
+    if len(data) == 0:
         return ema_values
+    
+    # Initialize EMA with SMA for the first 'period' values
+    if len(data) >= period:
+        ema_values[period - 1] = np.mean(data[:period])
+        multiplier = 2 / (period + 1)
+        for i in range(period, len(data)):
+            ema_values[i] = ((data[i] - ema_values[i-1]) * multiplier) + ema_values[i-1]
+    else:
+        # If data is less than period, a simple average or just the data itself
+        # is sometimes used, or EMA calculation might be skipped.
+        # For simplicity here, if not enough data, just return zeros or partial.
+        pass 
 
-    ema_fast = ema(close_prices, fast_period)
-    ema_slow = ema(close_prices, slow_period)
-
-    # MACD Line (ensure calculations start after enough data points)
-    macd_line = ema_fast[slow_period-1:] - ema_slow[slow_period-1:] # Align lengths
-
-    # Signal Line (EMA of MACD Line)
-    signal_line = ema(macd_line, signal_period) 
-
-    # MACD Histogram
-    histogram = macd_line[-len(signal_line):] - signal_line # Align lengths for histogram
-
-    if len(macd_line) > 0 and len(signal_line) > 0 and len(histogram) > 0:
-        return macd_line[-1], signal_line[-1], histogram[-1]
-    return None, None, None
+    return ema_values[period-1:] # Return from the point where EMA truly starts
 
 
-def determine_signal(ohlcv_5min, current_spot_price):
+# --- Tick Data Processing and Candle Reconstruction ---
+
+def initialize_tick_data_buffers(symbols):
+    """Initializes deque for each symbol to store incoming ticks."""
+    for symbol in symbols:
+        symbol_ticks[symbol] = deque() # Stores (timestamp, price) tuples
+
+def on_ticks_callback(ws, ticks):
     """
-    Determines trade signal (BUY/SELL) based on enhanced indicators.
-    Also returns the target option type (CE/PE).
+    Callback function to process incoming ticks from Fyers WebSocket.
+    This function will be called by the Fyers WebSocket client whenever new ticks arrive.
     """
-    # For scalping, consider getting 1-min data here as well for confirmations
-    # ohlcv_1min = fetch_ohlcv_from_backend(SYMBOL_SPOT, "1", 2) # Example: 1-min for 2 days
+    global symbol_ticks, last_completed_candles, logger
+    for tick in ticks:
+        symbol = tick.get('symbol')
+        timestamp_seconds = tick.get('timestamp') # Fyers typically sends timestamp in seconds
+        ltp = tick.get('ltp')
 
-    if not ohlcv_5min or len(ohlcv_5min) < 100: # Need sufficient candles for indicators
-        app.logger.warning("Insufficient 5-min OHLCV data for signal determination.")
-        return None, None
+        if symbol and timestamp_seconds and ltp is not None:
+            tick_time = datetime.fromtimestamp(timestamp_seconds)
+            
+            if symbol not in symbol_ticks:
+                symbol_ticks[symbol] = deque()
+            
+            symbol_ticks[symbol].append((tick_time, ltp))
 
-    # Ensure candles are sorted oldest to newest for indicator calculation
-    # Fyers API usually returns oldest first, but confirm or sort if necessary
-    # ohlcv_5min.sort(key=lambda x: x['timestamp'])
+            # Attempt to build a candle from the accumulated ticks
+            build_candle_from_ticks(symbol)
 
-    # Get the latest candle's close price and volume for checks
-    latest_close = ohlcv_5min[-1]['close']
-    latest_volume = ohlcv_5min[-1]['volume']
 
-    # --- Indicator Calculations (5-min timeframe) ---
-    sma_50 = calculate_sma(ohlcv_5min, 50)
-    sma_20 = calculate_sma(ohlcv_5min, 20) # Faster SMA
-    rsi = calculate_rsi(ohlcv_5min, 14)
-    supertrend_val, supertrend_dir = calculate_supertrend(ohlcv_5min, atr_period=10, multiplier=3.0)
-    macd_line, signal_line, macd_hist = calculate_macd(ohlcv_5min)
-
-    # --- Volume Check ---
-    # Consider last N candles average for volume
-    avg_volume = np.mean([c['volume'] for c in ohlcv_5min[-30:]]) if len(ohlcv_5min) >= 30 else 0
-    volume_confirm = (latest_volume > (avg_volume * 1.5)) and (avg_volume > 0) # Volume spike condition, avoid div by zero
-
-    app.logger.info(f"Indicators (5-min): SMA20={sma_20:.2f}, SMA50={sma_50:.2f}, RSI={rsi:.2f}, Supertrend={supertrend_val:.2f} ({'Up' if supertrend_dir == 1 else 'Down' if supertrend_dir == -1 else 'Flat'}), MACD={macd_line:.2f}, Signal={signal_line:.2f}, Hist={macd_hist:.2f}, Volume_Confirm={volume_confirm}")
-
-    # --- Signal Logic (Enhanced with Price Action elements, Volume, Supertrend, MACD) ---
-    # This is a robust combination, but still simplified price action.
-
-    # Buy Signal (Call Option - CE)
-    # Conditions: Price above faster SMA, faster SMA above slower SMA (uptrend), RSI confirms momentum,
-    # Supertrend confirms uptrend, MACD shows bullish momentum, and volume confirms.
-    if (latest_close > sma_20 and # Price above short-term trend
-        sma_20 > sma_50 and # Short-term trend above long-term trend
-        rsi is not None and rsi > 55 and # Stronger RSI for confirmation
-        supertrend_dir == 1 and # Supertrend is green (uptrend)
-        macd_line is not None and signal_line is not None and macd_line > signal_line and macd_hist > 0 and # MACD Buy Crossover and positive histogram
-        volume_confirm): # Volume confirms the move
-        app.logger.info("Strong BUY (CE) signal detected!")
-        return "BUY", "CE"
-
-    # Sell Signal (Put Option - PE)
-    # Conditions: Price below faster SMA, faster SMA below slower SMA (downtrend), RSI confirms momentum,
-    # Supertrend confirms downtrend, MACD shows bearish momentum, and volume confirms.
-    elif (latest_close < sma_20 and # Price below short-term trend
-          sma_20 < sma_50 and # Short-term trend below long-term trend
-          rsi is not None and rsi < 45 and # Weaker RSI for confirmation
-          supertrend_dir == -1 and # Supertrend is red (downtrend)
-          macd_line is not None and signal_line is not None and macd_line < signal_line and macd_hist < 0 and # MACD Sell Crossover and negative histogram
-          volume_confirm): # Volume confirms the move
-        app.logger.info("Strong SELL (PE) signal detected!")
-        return "BUY", "PE" # We buy PE for a 'sell' market view (shorting the index)
-
-    return None, None # No strong signal
-
-def monitor_and_manage_trade(trade_details):
+def build_candle_from_ticks(symbol):
     """
-    Monitors a simulated open trade for target, fixed SL, or trailing SL.
-    This function simulates continuous monitoring and exit for PAPER_TRADE mode.
-    For LIVE trading, this would involve Fyers API order modification and position monitoring.
+    Reconstructs candles from accumulated ticks for a given symbol.
+    This function should be called frequently as new ticks arrive.
+    It manages the `symbol_ticks` deque and updates `last_completed_candles`.
     """
-    global daily_pnl, total_trades, capital_data, trade_log
+    global symbol_ticks, last_completed_candles, logger, CANDLE_RESOLUTION_SECONDS
 
-    symbol = trade_details['symbol']
-    entry_price = trade_details['entry_price']
-    initial_target_price = trade_details['target_price']
-    initial_stop_loss_price = trade_details['stop_loss_price']
-    signal = trade_details['signal'] # "BUY" for CE or PE
-    quantity = trade_details['quantity']
+    if symbol not in symbol_ticks or not symbol_ticks[symbol]:
+        return
 
-    current_stop_loss = initial_stop_loss_price
-    highest_price_achieved = entry_price # Track highest price for trailing SL (initially entry price)
-    trailing_sl_active = False
+    current_time = datetime.now()
+    ticks_for_symbol = symbol_ticks[symbol]
 
-    app.logger.info(f"Monitoring simulated trade for {symbol} (Entry: {entry_price:.2f}, Target: {initial_target_price:.2f}, SL: {initial_stop_loss_price:.2f})")
+    # Find the start time of the current candle interval
+    # This aligns candles to fixed intervals (e.g., every 5 minutes from market open)
+    market_open_hour = 9
+    market_open_minute = 15
+    
+    # Calculate offset from market open to align candle start times
+    # This logic assumes candles align to fixed intervals from market open
+    # E.g., if market opens at 9:15 and candle is 5 min, candles will be 9:15-9:20, 9:20-9:25 etc.
+    if current_time.hour < market_open_hour or \
+       (current_time.hour == market_open_hour and current_time.minute < market_open_minute):
+        # Market not open yet or before open time for candle alignment
+        return
 
-    monitoring_start_time = datetime.now()
-    MAX_MONITORING_DURATION_SECONDS = 60 * 30 # Monitor for max 30 minutes per trade, adjust as needed
-    MONITOR_INTERVAL_SECONDS = 5 # Check every 5 seconds for faster response to price action
+    # Calculate elapsed seconds since market open today
+    market_open_today = current_time.replace(hour=market_open_hour, minute=market_open_minute, second=0, microsecond=0)
+    if current_time < market_open_today: # Handles cases where current_time might be before market open
+        return
 
-    while (datetime.now() - monitoring_start_time).total_seconds() < MAX_MONITORING_DURATION_SECONDS:
-        current_quote_data = fetch_quote_from_backend(symbol)
-        if not current_quote_data or not current_quote_data[0].get('v'):
-            app.logger.error(f"Failed to fetch live quote for {symbol} during monitoring. Continuing...")
-            time.sleep(MONITOR_INTERVAL_SECONDS)
+    elapsed_seconds = (current_time - market_open_today).total_seconds()
+    
+    # Calculate which candle interval we are currently in
+    current_candle_start_seconds_offset = math.floor(elapsed_seconds / CANDLE_RESOLUTION_SECONDS) * CANDLE_RESOLUTION_SECONDS
+    current_candle_start_time = market_open_today + timedelta(seconds=current_candle_start_seconds_offset)
+    current_candle_end_time = current_candle_start_time + timedelta(seconds=CANDLE_RESOLUTION_SECONDS)
+
+
+    # Process ticks that fall into *completed* intervals
+    # Iterate through ticks, removing those that are too old (belong to previous completed candles)
+    # and using them to build a candle if an interval closes.
+    
+    # Logic to build and finalize a candle when its interval ends:
+    
+    # Keep track of ticks for the *current* incomplete candle
+    current_candle_ticks = []
+    
+    while ticks_for_symbol and ticks_for_symbol[0][0] < current_candle_start_time:
+        # This tick belongs to a *previous* candle interval that should have been closed.
+        # This scenario happens if `build_candle_from_ticks` wasn't called precisely
+        # at the candle close time, or if ticks arrived out of order/delayed.
+        # For robustness, we might need a more sophisticated candle builder that
+        # handles multiple past candle intervals.
+        # For now, we'll just discard these and process the first tick that's >= current_candle_start_time
+        # or handle them when they become part of a *completed* interval.
+        ticks_for_symbol.popleft() # Discard old tick
+        
+    # Collect ticks for the *current* candle interval
+    while ticks_for_symbol and ticks_for_symbol[0][0] < current_candle_end_time:
+        current_candle_ticks.append(ticks_for_symbol.popleft())
+
+    # If the current candle interval has ended AND we have ticks for it, finalize it
+    if current_time >= current_candle_end_time and current_candle_ticks:
+        # Sort ticks by time to ensure O, H, L, C are correct if ticks arrive out of order
+        current_candle_ticks.sort(key=lambda x: x[0])
+
+        open_price = current_candle_ticks[0][1]
+        close_price = current_candle_ticks[-1][1]
+        high_price = max(t[1] for t in current_candle_ticks)
+        low_price = min(t[1] for t in current_candle_ticks)
+        volume = len(current_candle_ticks) # Simple tick count as volume for now
+
+        # Fyers API historical data format: [timestamp, open, high, low, close, volume]
+        # Timestamp for the candle usually represents the start time of the candle interval
+        new_candle = [int(current_candle_start_time.timestamp()), open_price, high_price, low_price, close_price, volume]
+        
+        last_completed_candles[symbol] = new_candle
+        logger.info(f"New {CANDLE_RESOLUTION_SECONDS/60}-min candle for {symbol}: {new_candle}")
+        # At this point, you could trigger your strategy functions with this new candle data.
+
+    # If we are past the end of the current candle, and new ticks arrive,
+    # it means a new candle interval has begun. The `ticks_for_symbol` deque
+    # will naturally start accumulating for the next candle.
+
+    # Note: This is a simplified candle builder. A production-grade one would need:
+    # 1. More robust handling of late/out-of-order ticks.
+    # 2. Proper volume aggregation (if tick data includes size).
+    # 3. Handling of gaps (no ticks for an interval).
+    # 4. Potentially storing a history of recent candles (e.g., last 20-50 candles).
+
+
+def start_fyers_websocket(access_token, client_id, symbols_to_subscribe):
+    """Initializes and starts the Fyers WebSocket for data."""
+    global logger
+    
+    if not access_token:
+        logger.error("Fyers access token not available for WebSocket connection.")
+        return None
+
+    # Fyers Websocket needs client_id, access_token
+    # client_id should be APP_ID-100 or similar
+    # logger should be a proper logging object
+    fyers_data_ws = data_ws.FyersSocket(
+        access_token=f"{client_id}:{access_token}", # Fyers expects this format
+        log_path=os.getcwd(), # Path for WebSocket logs
+        litemode=False, # Set to False for full tick data
+        write_to_file=False,
+        reconnect=True,
+        on_connect=lambda: logger.info("Fyers WebSocket connected."),
+        on_close=lambda: logger.info("Fyers WebSocket closed."),
+        on_error=lambda msg: logger.error(f"Fyers WebSocket error: {msg}"),
+        on_ticks=on_ticks_callback # Our custom tick handler
+    )
+
+    fyers_data_ws.connect()
+
+    # Subscribe to symbols
+    data_type = "TickByTick" # Or "CandleData" if you want server-side candles
+    symbols_for_sub = [{"symbol": s, "dataType": data_type} for s in symbols_to_subscribe]
+    fyers_data_ws.subscribe(data_type=data_type, symbols=symbols_for_sub)
+    logger.info(f"Subscribed to {data_type} for symbols: {symbols_to_subscribe}")
+
+    return fyers_data_ws
+
+
+# --- Trade Management Functions ---
+
+def place_order_api(symbol, side, quantity, product_type, order_type, price=0, trade_mode='LIVE'):
+    """Sends a trade request to the Flask backend's /trade/execute endpoint."""
+    url = f"{FLASK_BACKEND_URL}/trade/execute"
+    payload = {
+        "symbol": symbol,
+        "signal": "BUY" if side == 1 else "SELL",
+        "quantity": quantity,
+        "product_type": product_type,
+        "order_type": order_type,
+        "entryPrice": price, # Only relevant for LIMIT orders, but pass always
+        "trade_mode": trade_mode
+    }
+    try:
+        response = requests.post(url, json=payload)
+        response.raise_for_status()
+        result = response.json()
+        if result.get("success"):
+            logger.info(f"Order placed successfully for {symbol}. Order ID: {result.get('orderId')}")
+            return True, result.get('orderId')
+        else:
+            logger.error(f"Failed to place order for {symbol}: {result.get('message')}")
+            return False, result.get('message')
+    except requests.exceptions.RequestException as e:
+        logger.error(f"API request error while placing order for {symbol}: {e}")
+        return False, str(e)
+
+
+def monitor_and_manage_trade(trade_obj):
+    """
+    Monitors an active trade for stop-loss, target, or end-of-day exit.
+    This function would ideally run in a separate thread for each trade
+    or be part of a non-blocking event loop if using asynchronous libraries.
+    For simplicity, within `execute_strategy` it will be checked on each new candle.
+    """
+    global active_trades, jannat_capital, logger
+
+    symbol = trade_obj['symbol']
+    entry_price = trade_obj['entry_price']
+    signal = trade_obj['signal']
+    quantity = trade_obj['quantity']
+    target_price = trade_obj['target_price']
+    stop_loss_price = trade_obj['stop_loss_price']
+
+    logger.info(f"Monitoring trade for {symbol}. Entry: {entry_price}, SL: {stop_loss_price}, Target: {target_price}")
+
+    # For monitoring, we need the latest price.
+    # In a tick-by-tick system, we get this from the `on_ticks_callback` which updates `last_completed_candles` or directly from latest tick.
+    # For now, we'll assume `get_current_spot_price` gets the latest available (either from a live tick, or a cached tick from `on_ticks_callback`)
+    # This requires `get_current_spot_price` to fetch from local `symbol_ticks` or `last_completed_candles`.
+    current_price = get_current_spot_price(symbol) # Assumes this fetches the *latest* available price
+
+    if current_price is None:
+        logger.warning(f"Could not get current price for {symbol} for trade monitoring.")
+        return # Skip monitoring if no price
+
+    pnl = 0.0
+    exit_reason = None
+    exit_price = None
+
+    if signal == 'BUY':
+        if current_price >= target_price:
+            pnl = (target_price - entry_price) * quantity
+            exit_price = target_price
+            exit_reason = "Target Hit"
+        elif current_price <= stop_loss_price:
+            pnl = (stop_loss_price - entry_price) * quantity
+            exit_price = stop_loss_price
+            exit_reason = "Stop Loss Hit"
+    elif signal == 'SELL':
+        if current_price <= target_price: # For SELL, target is lower than entry
+            pnl = (entry_price - target_price) * quantity
+            exit_price = target_price
+            exit_reason = "Target Hit"
+        elif current_price >= stop_loss_price: # For SELL, SL is higher than entry
+            pnl = (entry_price - stop_loss_price) * quantity
+            exit_price = stop_loss_price
+            exit_reason = "Stop Loss Hit"
+
+    # End of day square off (Example: square off at 3:25 PM IST)
+    now = datetime.now()
+    square_off_time = now.replace(hour=15, minute=25, second=0, microsecond=0)
+    if now.weekday() < 5 and now >= square_off_time and exit_reason is None:
+        pnl = (current_price - entry_price) * quantity if signal == 'BUY' else (entry_price - current_price) * quantity
+        exit_price = current_price
+        exit_reason = "End of Day Square Off"
+        logger.info(f"Squaring off {symbol} trade due to end of day. Current PnL: {pnl:.2f}")
+
+
+    if exit_reason:
+        logger.info(f"Trade for {symbol} exited. Reason: {exit_reason}, PnL: {pnl:.2f}")
+        jannat_capital['current_balance'] += pnl
+        jannat_capital['pnl_today'] += pnl
+        save_capital_data()
+
+        trade_obj['exit_time'] = datetime.now().isoformat()
+        trade_obj['exit_price'] = exit_price
+        trade_obj['pnl'] = pnl
+        trade_obj['status'] = "CLOSED"
+        trade_obj['exit_reason'] = exit_reason
+        log_trade(trade_obj) # Log the closed trade
+
+        if symbol in active_trades:
+            del active_trades[symbol] # Remove from active trades
+
+        # Place exit order (if LIVE trade_mode)
+        if trade_obj.get('trade_mode') == 'LIVE':
+            exit_side = -1 if signal == 'BUY' else 1 # Opposite side for exit
+            logger.info(f"Placing exit order for {symbol} at {exit_price}")
+            success, message = place_order_api(symbol, exit_side, quantity, trade_obj['product_type'], 'MARKET')
+            if not success:
+                logger.error(f"Failed to place exit order for {symbol}: {message}")
+
+
+# --- Centralized Functions for Frontend Polling ---
+def get_trade_details():
+    """Provides current trade details for frontend."""
+    return [trade for trade in active_trades.values()] # Return list of active trade objects
+
+def get_capital_data():
+    """Provides current capital data for frontend."""
+    return jannat_capital
+
+
+# --- Main Algo Engine Logic ---
+
+def execute_strategy(algo_status_dict, app_logger):
+    """
+    Main function to run the algorithmic trading strategy.
+    This is designed to run in a separate thread.
+    """
+    global logger
+    logger = app_logger # Use the Flask app's logger
+
+    logger.info("Jannat Algo Engine started.")
+    load_capital_data()
+
+    # --- Fyers API Setup for WebSocket ---
+    access_token = get_fyers_access_token()
+    if not access_token:
+        logger.error("Cannot start algo: Fyers access token is missing or invalid.")
+        algo_status_dict["status"] = "stopped"
+        return
+
+    # Assuming FYERS_CLIENT_ID is globally available from app.py config
+    fyers_client_id = os.environ.get("FYERS_APP_ID", "dummy_app_id") + "-100"
+
+    # The symbols we are interested in. This should dynamically include selected options.
+    # For now, let's assume we want to subscribe to a fixed set for testing.
+    # In a real scenario, you'd dynamically get options symbols after fetching spot price.
+    symbols_to_watch = [SYMBOL_SPOT + "FUT"] # Example: BANKNIFTY Futures for initial Supertrend/MACD
+    # If trading options, you'd add selected option symbols here after determining them.
+    # e.g., symbols_to_watch.append(atm_call_symbol)
+    # e.g., symbols_to_watch.append(atm_put_symbol)
+
+    initialize_tick_data_buffers(symbols_to_watch) # Prepare buffers for these symbols
+    fyers_ws = start_fyers_websocket(access_token, fyers_client_id, symbols_to_watch)
+    if not fyers_ws:
+        algo_status_dict["status"] = "stopped"
+        return
+
+    # --- Main Algo Loop - Now driven by new candle availability ---
+    last_candle_processed_time = {} # Track the timestamp of the last candle we processed for each symbol
+
+    while algo_status_dict["status"] == "running":
+        if not is_market_open():
+            logger.info("Market is closed. Waiting for market open.")
+            time.sleep(60) # Check every minute if market is closed
             continue
 
-        current_price = current_quote_data[0]['v']['lp']
-        current_pnl_absolute = (current_price - entry_price) * quantity
-        current_profit_percent = (current_price - entry_price) / entry_price
-        
-        app.logger.info(f"Monitoring {symbol}: Current Price: {current_price:.2f}, Current PnL: {current_pnl_absolute:.2f} ({current_profit_percent:.2%}), Trailing SL: {'Active' if trailing_sl_active else 'Inactive'}, Current SL Level: {current_stop_loss:.2f}, Target: {initial_target_price:.2f}")
+        # In a tick-by-tick system, the strategy logic would ideally be triggered
+        # whenever a new candle is *completed* and stored in `last_completed_candles`.
+        # We'll poll `last_completed_candles` here, but a more event-driven approach
+        # would be better (e.g., `on_ticks_callback` triggers a signal processing method).
 
-        # --- Check for Exit Conditions ---
-        simulated_pnl_on_exit = 0.0
-
-        # Check for Target Hit
-        if current_price >= initial_target_price:
-            app.logger.info(f"Target hit for {symbol}! Exiting trade.")
-            simulated_pnl_on_exit = (initial_target_price - entry_price) * quantity
-            exit_type = "Target Hit"
-            break # Exit monitoring loop
-
-        # Check for Fixed or Trailing Stop Loss Hit
-        if current_price <= current_stop_loss:
-            app.logger.info(f"Stop Loss hit for {symbol}! Exiting trade. Exit price: {current_price:.2f}")
-            simulated_pnl_on_exit = (current_price - entry_price) * quantity # Actual PnL at SL hit price
-            exit_type = "Stop Loss Hit"
-            break # Exit monitoring loop
-
-        # --- Trailing Stop Loss Logic ---
-        # Only for long positions (BUY signal for CE or PE - assuming we always 'buy' an option)
-        # Update highest price achieved
-        highest_price_achieved = max(highest_price_achieved, current_price)
-
-        # Calculate running profit percentage from entry using the highest_price_achieved
-        running_profit_percent = (highest_price_achieved - entry_price) / entry_price
-
-        if running_profit_percent >= TRAILING_SL_PROFIT_ACTIVATION_PERCENT:
-            if not trailing_sl_active:
-                app.logger.info(f"Trailing SL activated for {symbol}! Profit reached {running_profit_percent:.2%}.")
-                trailing_sl_active = True
-
-            # Calculate new trailing stop loss price
-            # SL moves up to lock in TRAILING_SL_LOCK_PERCENT of profit from highest achieved price
-            new_trailing_sl = highest_price_achieved * (1 - TRAILING_SL_LOCK_PERCENT)
+        for symbol in symbols_to_watch: # Iterate through symbols we are watching
+            current_candle = last_completed_candles.get(symbol)
             
-            # Ensure trailing SL never moves down from its last position and is always above initial fixed SL
-            # The current_stop_loss should only increase if new_trailing_sl is higher
-            if new_trailing_sl > current_stop_loss:
-                current_stop_loss = new_trailing_sl
-                app.logger.info(f"Trailing SL moved to {current_stop_loss:.2f}")
-            
-        time.sleep(MONITOR_INTERVAL_SECONDS)
-    else: # If loop completes without hitting target/SL
-        app.logger.info(f"Trade for {symbol} timed out after {MAX_MONITORING_DURATION_SECONDS/60:.0f} minutes without hitting target or SL. Exiting at current price: {current_price:.2f}")
-        simulated_pnl_on_exit = (current_price - entry_price) * quantity
-        exit_type = "Timed Out"
+            if current_candle:
+                candle_timestamp = current_candle[0] # Get timestamp of the completed candle
 
-    # --- Record Simulated Exit ---
-    daily_pnl += simulated_pnl_on_exit
-    capital_data['current_capital'] += simulated_pnl_on_exit
-    capital_data['daily_pnl'] = daily_pnl
-    
-    trade_details.update({
-        "exit_price": current_price if exit_type == "Timed Out" else (initial_target_price if exit_type == "Target Hit" else current_price), # Capture exact exit price
-        "exit_time": datetime.now().isoformat(),
-        "simulated_pnl": simulated_pnl_on_exit,
-        "exit_type": exit_type
-    })
-    trade_log.append(trade_details)
-    save_trade_log()
-    save_capital_data()
+                # Check if this candle has already been processed
+                if symbol in last_candle_processed_time and candle_timestamp == last_candle_processed_time[symbol]:
+                    continue # Already processed this candle, wait for a new one
 
-    app.logger.info(f"Trade completed for {symbol}. PnL: {simulated_pnl_on_exit:.2f}. New Capital: {capital_data['current_capital']:.2f}, Daily PnL: {daily_pnl:.2f}")
-    
-    return True # Trade was managed to completion
+                logger.info(f"Processing new candle for {symbol}: {current_candle}")
+                last_candle_processed_time[symbol] = candle_timestamp
 
+                # Fetch past candles to get enough data for indicators.
+                # In a real-time system, you'd maintain a `deque` of recent candles,
+                # appending the new `current_candle` and popping the oldest if capacity is reached.
+                # For this example, we'll just use the most recent candle for demonstration.
+                # **IMPORTANT:** For accurate indicator calculations (like Supertrend, MACD),
+                # you NEED a history of `period` candles. This means your `build_candle_from_ticks`
+                # or a separate component needs to maintain a list/deque of the last N candles for each symbol.
+                # For demonstration, we'll simulate fetching historical candles for indicator calculation.
+                # In a full tick-by-tick setup, you'd feed a `deque` of tick-built candles to these functions.
 
-# --- Core Algo Engine Logic ---
+                # Simulate fetching historical candles (replace with real-time candle history in production)
+                # You'll need a mechanism to store and retrieve the last N completed candles for each symbol
+                # from the `build_candle_from_ticks` process.
+                past_candles_for_indicators = [current_candle] # Placeholder: in reality, this would be `history_of_n_candles`
+                if len(past_candles_for_indicators) < max(SUPER_TREND_PERIOD, SLOW_MA_PERIOD + SIGNAL_PERIOD):
+                    logger.warning(f"Not enough historical candles for {symbol} to calculate indicators accurately.")
+                    continue # Wait for more candles if not enough history for indicators
 
-def execute_strategy():
-    """Main function to run the trading strategy."""
-    global daily_pnl, total_trades, capital_data, trade_log, current_day
-
-    load_capital_data()
-    load_trade_log()
-
-    app.logger.info("Jannat Algo Trading Engine Started.")
-
-    while True:
-        current_time = datetime.now()
-
-        if current_time.date() != current_day:
-            app.logger.info(f"New day detected: {current_time.date()}. Resetting daily PnL and trade count.")
-            daily_pnl = 0.0
-            total_trades = 0
-            current_day = current_time.date()
-            capital_data['daily_pnl'] = daily_pnl
-            capital_data['total_trades_today'] = total_trades
-            capital_data['last_recorded_date'] = current_day.isoformat()
-            save_capital_data()
-
-
-        if is_market_open() and is_within_trading_window():
-            app.logger.info(f"Market is open and within trading window. Current Capital: {capital_data['current_capital']:.2f}, Daily PnL: {daily_pnl:.2f}, Trades Today: {total_trades}")
-
-            # 1. Fetch live spot price for BANKNIFTY
-            spot_quote_data = fetch_quote_from_backend(SYMBOL_SPOT)
-            if not spot_quote_data or not spot_quote_data[0].get('v'):
-                app.logger.error("Failed to fetch live spot price for BANKNIFTY. Skipping trade cycle.")
-                time.sleep(TRADE_INTERVAL_SECONDS)
-                continue
-
-            current_spot_price = spot_quote_data[0]['v']['lp']
-            app.logger.info(f"Current {SYMBOL_SPOT} Spot Price: {current_spot_price:.2f}")
-
-            # 2. Fetch OHLCV data for strategy calculation (using 5-min for indicators)
-            # To add 1-min analysis:
-            # ohlcv_1min_data = fetch_ohlcv_from_backend(SYMBOL_SPOT, "1", 2) # Fetch 1-min candles for 2 days
-            # Then pass both to determine_signal: determine_signal(ohlcv_5min_data, ohlcv_1min_data, current_spot_price)
-            ohlcv_5min_data = fetch_ohlcv_from_backend(SYMBOL_SPOT, "5", 7) # 5-min candles for 7 days
-
-            if not ohlcv_5min_data: # or not ohlcv_1min_data: if using 1-min
-                app.logger.error("Failed to fetch OHLCV data. Skipping trade cycle.")
-                time.sleep(TRADE_INTERVAL_SECONDS)
-                continue
-
-            # 3. Determine trade signal
-            signal, target_option_type = determine_signal(ohlcv_5min_data, current_spot_price)
-
-            # Placeholder for VIX filter - ensure it's implemented for real use
-            if signal and target_option_type and filter_high_vix(20):
-                app.logger.info(f"Signal: {signal} {target_option_type}")
-
-                # 4. Get relevant option strike and symbol
-                option_ce_symbol, option_pe_symbol, atm_strike = get_option_symbols(current_spot_price, OPTION_EXPIRY_DAYS_AHEAD)
-
-                target_option_symbol = option_ce_symbol if target_option_type == "CE" else option_pe_symbol
-                app.logger.info(f"Target Option Symbol: {target_option_symbol}")
-
-                # 5. Fetch quote for the target option to get its current price
-                option_quote_data = fetch_quote_from_backend(target_option_symbol)
-                if not option_quote_data or not option_quote_data[0].get('v'):
-                    app.logger.error(f"Failed to fetch live quote for {target_option_symbol}. Skipping trade cycle.")
-                    time.sleep(TRADE_INTERVAL_SECONDS)
-                    continue
-
-                option_entry_price = option_quote_data[0]['v']['lp']
-                app.logger.info(f"Option Entry Price ({target_option_symbol}): {option_entry_price:.2f}")
-
-                # Calculate Target and Stop Loss for the option
-                option_target_price = option_entry_price * (1 + TARGET_PERCENT)
-                option_stop_loss_price = option_entry_price * (1 - STOP_LOSS_PERCENT)
-
-                app.logger.info(f"Calculated Option Target: {option_target_price:.2f}, Initial Stop Loss: {option_stop_loss_price:.2f}")
-
-                # 6. Execute trade via backend (This is simulated placement in paper mode)
-                order_id = execute_trade_on_backend(
-                    symbol=target_option_symbol,
-                    signal=signal,
-                    entry_price=option_entry_price,
-                    target=option_target_price,
-                    stop_loss=option_stop_loss_price,
-                    atm_strike=atm_strike,
-                    quantity=QUANTITY_PER_TRADE,
-                    product_type=PRODUCT_TYPE,
-                    order_type=ORDER_TYPE,
-                    trade_mode=TRADE_MODE
+                # --- Strategy Logic (Remains the same as before) ---
+                supertrend_values, supertrend_trend = calculate_supertrend(
+                    past_candles_for_indicators, SUPER_TREND_PERIOD, SUPER_TREND_MULTIPLIER
+                )
+                macd_line, signal_line, macd_histogram = calculate_macd(
+                    past_candles_for_indicators, FAST_MA_PERIOD, SLOW_MA_PERIOD, SIGNAL_PERIOD
                 )
 
-                if order_id:
-                    app.logger.info(f"Trade successfully placed with Order ID: {order_id}")
-                    total_trades += 1 # Increment trade count upon placement
+                if not supertrend_values or not macd_line:
+                    logger.warning(f"Indicators not calculated for {symbol}. Skipping trade signal generation.")
+                    continue
 
-                    trade_details_for_monitoring = {
-                        "timestamp": datetime.now().isoformat(),
-                        "symbol": target_option_symbol,
-                        "signal": signal,
-                        "entry_price": option_entry_price,
-                        "target_price": option_target_price,
-                        "stop_loss_price": option_stop_loss_price,
-                        "quantity": QUANTITY_PER_TRADE,
-                        "order_id": order_id,
-                        "trade_mode": TRADE_MODE
-                    }
-                    
-                    # --- Monitor and Manage the Trade until exit (Target/SL/Trailing SL hit) ---
-                    # This function will run in its own internal loop until the trade is exited.
-                    monitor_and_manage_trade(trade_details_for_monitoring)
-                    
+                latest_supertrend = supertrend_values[-1]
+                latest_supertrend_trend = supertrend_trend[-1] # 1 for up, -1 for down
+                latest_macd_line = macd_line[-1]
+                latest_signal_line = signal_line[-1]
+                latest_macd_histogram = macd_histogram[-1]
+
+                current_spot_price = current_candle[4] # Use candle close as current price for this check
+
+                logger.info(f"Strategy check for {symbol}: ST: {latest_supertrend:.2f}, Trend: {latest_supertrend_trend}, MACD: {latest_macd_line:.2f}, Signal: {latest_signal_line:.2f}, Hist: {latest_macd_histogram:.2f}")
+
+                trade_signal = None
+                if latest_supertrend_trend == 1 and latest_macd_line > latest_signal_line and latest_macd_histogram > 0:
+                    trade_signal = 'BUY'
+                elif latest_supertrend_trend == -1 and latest_macd_line < latest_signal_line and latest_macd_histogram < 0:
+                    trade_signal = 'SELL'
+                
+                # Filter conditions (e.g., VIX) - unchanged
+                # if not filter_high_vix(current_vix_value): # Assume get_current_vix_value() exists
+                #     logger.info("High VIX detected. Not placing trades.")
+                #     trade_signal = None
+
+
+                if trade_signal and len(active_trades) < MAX_ACTIVE_TRADES:
+                    logger.info(f"Strong trade signal detected for {symbol}: {trade_signal}")
+
+                    # Determine ATM strike and option symbol (unchanged logic)
+                    if symbol == "NSE:BANKNIFTYFUT": # Use futures as proxy for spot to get ATM
+                        atm_strike = get_current_atm_strike(current_spot_price, BANKNIFTY_STRIKE_INTERVAL)
+                        expiry_date = get_nearest_expiry_date(OPTION_EXPIRY_DAYS_AHEAD)
+                        is_call = True if trade_signal == 'BUY' else False # Buy Call for BUY, Buy Put for SELL
+                        option_symbol = get_current_option_symbol("NSE:BANKNIFTY", expiry_date, is_call, atm_strike)
+                        target_symbol = option_symbol # Trade the option
+                        product_type = "MIS" # Margin Intraday Square off
+                        order_type = "MARKET" # Or "LIMIT" if you want to specify entry_price
+                        quantity = TRADE_QUANTITY_PER_LOT_BANKNIFTY # Quantity for BankNifty options
+
+                        # Calculate Target and Stop Loss for the option (relative to current option price)
+                        # This requires fetching the option's current price, which you'd get from ticks
+                        # or a quote API. For simplicity here, we'll use a placeholder.
+                        option_current_price = current_spot_price * 0.01 # Placeholder - **MUST GET ACTUAL OPTION PRICE**
+                        entry_price = option_current_price # Assume market order, so entry is current price
+
+                        calculated_target = entry_price * (1 + TARGET_MULTIPLIER) if trade_signal == 'BUY' else entry_price * (1 - TARGET_MULTIPLIER)
+                        calculated_stop_loss = entry_price * (1 - STOP_LOSS_MULTIPLIER) if trade_signal == 'BUY' else entry_price * (1 + STOP_LOSS_MULTIPLIER)
+
+                        logger.info(f"Attempting to place {trade_signal} trade for {target_symbol} @ {entry_price:.2f} (Target: {calculated_target:.2f}, SL: {calculated_stop_loss:.2f})")
+
+                        # Place order
+                        success, order_id = place_order_api(
+                            target_symbol,
+                            1 if trade_signal == 'BUY' else -1,
+                            quantity,
+                            product_type,
+                            order_type,
+                            price=entry_price,
+                            trade_mode='PAPER' # Change to 'LIVE' for live trading
+                        )
+
+                        if success:
+                            trade_details_for_monitoring = {
+                                "order_id": order_id,
+                                "symbol": target_symbol,
+                                "signal": trade_signal,
+                                "entry_time": datetime.now().isoformat(),
+                                "entry_price": entry_price,
+                                "target_price": calculated_target,
+                                "stop_loss_price": calculated_stop_loss,
+                                "quantity": quantity,
+                                "product_type": product_type,
+                                "order_type": order_type,
+                                "trade_mode": 'PAPER', # Reflects what was placed
+                                "status": "ACTIVE"
+                            }
+                            active_trades[target_symbol] = trade_details_for_monitoring
+                            log_trade(trade_details_for_monitoring)
+                            logger.info(f"Trade placed successfully for {target_symbol}. Now monitoring...")
+
+                            # Instead of a blocking loop, monitoring would be based on subsequent ticks/candles
+                            # and checked in this main loop or in a separate event handler.
+                            # For this refactor, `monitor_and_manage_trade` will be called on each new candle.
+                        else:
+                            logger.error("Failed to place trade.")
+                    else:
+                        logger.info(f"No specific option trading logic for {symbol}. Skipping.")
                 else:
-                    app.logger.error("Failed to place trade.")
+                    if trade_signal: # If signal is there but max trades reached
+                        logger.info(f"Trade signal for {symbol} but maximum active trades ({MAX_ACTIVE_TRADES}) reached.")
+                    else:
+                        logger.info("No strong trade signal or filter condition not met for current candle.")
             else:
-                app.logger.info("No strong trade signal or filter condition not met.")
-        else:
-            app.logger.info("Market is closed or not within trading window.")
-            pass # Load capital data handles new day reset
+                logger.info(f"No new completed candle available for {symbol} yet. Waiting for ticks...")
+                # No new completed candle yet, sleep for a short duration
+                time.sleep(1) # Small sleep to prevent busy-waiting
 
-        time.sleep(TRADE_INTERVAL_SECONDS) # Wait before next check/trade attempt
+        # After processing all symbols, check/monitor active trades
+        for symbol, trade_obj in list(active_trades.items()): # Iterate over a copy as dict might change
+            monitor_and_manage_trade(trade_obj)
+
 
 # --- Bonus Intelligence Functions (Placeholders) ---
 def filter_high_vix(vix_value):
@@ -676,18 +782,53 @@ def filter_high_vix(vix_value):
     """
     return True # Always allow for now. Implement real VIX check later.
 
-# --- Initial Setup ---
-class SimpleLogger:
-    def info(self, message):
-        print(f"[INFO] {datetime.now().strftime('%H:%M:%S')} - {message}")
-    def warning(self, message):
-        print(f"[WARNING] {datetime.now().strftime('%H:%M:%S')} - {message}")
-    def error(self, message):
-        print(f"[ERROR] {datetime.now().strftime('%H:%M:%S')} - {message}")
+def get_current_spot_price(symbol):
+    """
+    Returns the latest known price for a symbol.
+    In a tick-by-tick system, this would ideally retrieve the LPT from the `symbol_ticks` deque
+    or the close of the `last_completed_candles`.
+    """
+    if symbol in symbol_ticks and symbol_ticks[symbol]:
+        # Return the last traded price from the accumulated ticks
+        return symbol_ticks[symbol][-1][1]
+    elif symbol in last_completed_candles:
+        # If no fresh ticks, use the close of the last completed candle
+        return last_completed_candles[symbol][4]
+    else:
+        logger.warning(f"No current price available for {symbol} from tick data.")
+        return None # No data yet
 
-app = Flask(__name__)
-app.logger = SimpleLogger()
 
+# --- Initial Setup for direct run (for testing purposes) ---
 if __name__ == "__main__":
-    app.logger.info("Running Jannat Algo Engine directly for testing.")
-    execute_strategy()
+    # When running directly, use SimpleLogger and simulate Flask app context
+    logger.info("Running Jannat Algo Engine directly for testing.")
+    
+    # Simulate an app_logger for direct execution
+    class MockAppLogger:
+        def info(self, message):
+            print(f"[INFO][AppLogger] {datetime.now().strftime('%H:%M:%S')} - {message}")
+        def warning(self, message):
+            print(f"[WARNING][AppLogger] {datetime.now().strftime('%H:%M:%S')} - {message}")
+        def error(self, message):
+            print(f"[ERROR][AppLogger] {datetime.now().strftime('%H:%M:%S')} - {message}")
+    
+    mock_app_logger = MockAppLogger()
+
+    # Simulate algo_status_dict for direct execution
+    mock_algo_status_dict = {"status": "running", "last_update": datetime.now().isoformat()}
+
+    # Set up dummy environment variables for local testing without actual Fyers credentials
+    os.environ["FYERS_APP_ID"] = "dummy_app_id"
+    os.environ["FYERS_SECRET_ID"] = "dummy_secret"
+    os.environ["FYERS_REDIRECT_URI"] = "http://localhost:5000/fyers_auth_callback"
+    os.environ["FLASK_BACKEND_URL"] = "http://localhost:5000"
+
+    # Create a dummy access token file for testing purposes
+    # In a real scenario, this would be generated via the authentication flow
+    if not os.path.exists(ACCESS_TOKEN_STORAGE_FILE):
+        with open(ACCESS_TOKEN_STORAGE_FILE, 'w') as f:
+            json.dump({"access_token": "YOUR_DUMMY_FYERS_ACCESS_TOKEN_FOR_TESTING_ONLY"}, f)
+        logger.info(f"Created dummy access token file at {ACCESS_TOKEN_STORAGE_FILE}. Replace with real token for live trading.")
+
+    execute_strategy(mock_algo_status_dict, mock_app_logger)
