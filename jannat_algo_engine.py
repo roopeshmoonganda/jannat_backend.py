@@ -7,6 +7,8 @@ import math
 import numpy as np
 from collections import deque
 import threading
+import logging # Import logging module
+import sys # Import sys module for stdout
 
 # --- Fyers API V3 Imports ---
 from fyers_apiv3 import fyersModel
@@ -64,21 +66,17 @@ CANDLE_RESOLUTION_SECONDS = 300 # 5 minutes for example (5 * 60)
 latest_prices = {}
 websocket_client = None # To store the Fyers WebSocket client instance
 
-# Logger placeholder (will be replaced by Flask app.logger)
-class SimpleLogger:
-    def info(self, message):
-        print(f"[INFO] {datetime.now().strftime('%H:%M:%S')} - {message}")
-    def warning(self, message):
-        print(f"[WARNING] {datetime.now().strftime('%H:%M:%S')} - {message}")
-    def error(self, message, exc_info=False): # Added exc_info for full tracebacks
-        print(f"[ERROR] {datetime.now().strftime('%H:%M:%S')} - {message}")
-        if exc_info:
-            import traceback
-            traceback.print_exc()
-    def debug(self, message): # Added for debug messages
-        print(f"[DEBUG] {datetime.now().strftime('%H:%M:%S')} - {message}")
+# --- Configure Logging ---
+# Get the logger for this module
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.DEBUG) # Set to DEBUG to capture all messages
 
-logger = SimpleLogger() # Default logger, will be overridden by Flask's app.logger
+# Create a StreamHandler to output logs to stdout
+if not logger.handlers: # Prevent adding multiple handlers if run multiple times
+    handler = logging.StreamHandler(sys.stdout)
+    formatter = logging.Formatter('[%(asctime)s] %(levelname)s in %(name)s: %(message)s')
+    handler.setFormatter(formatter)
+    logger.addHandler(handler)
 
 
 # --- Fyers WebSocket Data Handlers ---
@@ -331,7 +329,7 @@ def calculate_supertrend(candles, period, multiplier):
                 supertrend[i] = max(final_lower_band[i], supertrend[i-1])
             elif closes[i] < supertrend[i-1] and trend[i-1] == -1:
                 trend[i] = -1
-                supertrend[i] = min(final_upper_band[i], supertrend[i-1])
+                supertrend[i] = min(final_upper_band[i], final_upper_band[i-1]) # Corrected here: min with current and previous upper band
             elif closes[i] > supertrend[i-1] and trend[i-1] == -1:
                 trend[i] = 1
                 supertrend[i] = final_lower_band[i]
@@ -381,6 +379,7 @@ def _calculate_ema(data, period):
     
     ema_values = np.zeros_like(data, dtype=float)
     
+    # Simple Moving Average for the first 'period' values for initial EMA
     ema_values[period - 1] = np.mean(data[:period])
     multiplier = 2 / (period + 1)
     
@@ -449,22 +448,26 @@ def build_candle_from_ticks(symbol):
     # Calculate the current candle's start time and its corresponding end time
     current_candle_start_seconds_offset = math.floor(elapsed_seconds / CANDLE_RESOLUTION_SECONDS) * CANDLE_RESOLUTION_SECONDS
     current_candle_start_time = market_open_today + timedelta(seconds=current_candle_start_seconds_offset)
-    current_candle_end_time = current_candle_start_time + timedelta(seconds=CANDLE_RESOLUTION_SECONDS)
+    # current_candle_end_time = current_candle_start_time + timedelta(seconds=CANDLE_RESOLUTION_SECONDS) # Not directly used for tick processing logic below
 
-    # Process ticks that are *older* than or within the *just completed* candle interval.
-    
+
+    # Process ticks that are *older* than the start of the *current* candle interval.
+    # These ticks belong to a *completed* candle.
     ticks_for_completed_candle = deque()
-    # Move ticks that belong to a *completed* candle interval (i.e., their timestamp is less than
-    # the start time of the *current* candle interval)
     while ticks_for_symbol and ticks_for_symbol[0][0] < current_candle_start_time:
         ticks_for_completed_candle.append(ticks_for_symbol.popleft())
 
-    # If we have ticks for a completed candle and the current time is beyond its end
-    if ticks_for_completed_candle and current_time >= current_candle_end_time:
+    # If we have collected ticks for a completed candle:
+    if ticks_for_completed_candle:
         # The start time of this completed candle would be `current_candle_start_time - timedelta(seconds=CANDLE_RESOLUTION_SECONDS)`
-        # because current_candle_start_time refers to the *current* interval's start.
         completed_candle_start_time = current_candle_start_time - timedelta(seconds=CANDLE_RESOLUTION_SECONDS)
         
+        # Check if this completed candle has already been processed based on its start time
+        # This prevents duplicate candle processing if the tick stream lags or repeats
+        if symbol in last_completed_candles and last_completed_candles[symbol][0] == int(completed_candle_start_time.timestamp()):
+            # logger.debug(f"Candle for {symbol} starting {completed_candle_start_time} already processed. Skipping.")
+            return
+
         sorted_ticks = sorted(list(ticks_for_completed_candle), key=lambda x: x[0])
 
         if sorted_ticks:
@@ -476,17 +479,16 @@ def build_candle_from_ticks(symbol):
 
             new_candle = [int(completed_candle_start_time.timestamp()), open_price, high_price, low_price, close_price, volume]
             
-            # This is simplified: in reality, you'd append this to a list of historical candles
-            # for the symbol, not just replace the last_completed_candles.
+            # Store this as the last completed candle for the symbol
             last_completed_candles[symbol] = new_candle
-            logger.info(f"New {CANDLE_RESOLUTION_SECONDS/60}-min candle for {symbol}: {new_candle}")
+            logger.info(f"New {CANDLE_RESOLUTION_SECONDS/60}-min candle for {symbol} completed: {datetime.fromtimestamp(new_candle[0])} - O:{new_candle[1]}, H:{new_candle[2]}, L:{new_candle[3]}, C:{new_candle[4]}, V:{new_candle[5]}")
             # The strategy logic will pick this up in the main loop.
 
 
-def start_fyers_websocket(access_token, app_logger_instance):
+def start_fyers_websocket(access_token):
     """Initializes and starts the Fyers WebSocket connection for data."""
     global websocket_client, logger
-    logger = app_logger_instance
+    # logger is already configured globally, no need to reassign app_logger_instance
 
     logger.info("Attempting to start Fyers WebSocket...")
     try:
@@ -640,13 +642,15 @@ def get_capital_data():
 
 # --- Main Algo Engine Logic ---
 
-def execute_strategy(algo_status_dict, app_logger_instance):
+def execute_strategy(algo_status_dict, app_logger_instance_UNUSED):
     """
     Main function to run the algorithmic trading strategy.
     This is designed to run in a separate thread.
+    The app_logger_instance_UNUSED argument is kept for compatibility with app.py
+    but is not used as 'logger' is now globally configured.
     """
     global logger, websocket_client
-    logger = app_logger_instance # Use the Flask app's logger
+    # logger is already configured globally via logging.getLogger(__name__)
 
     logger.info("Jannat Algo Engine started. Loading capital data...")
     load_capital_data()
@@ -660,7 +664,7 @@ def execute_strategy(algo_status_dict, app_logger_instance):
         return
 
     # Initialize Fyers WebSocket connection
-    websocket_client = start_fyers_websocket(access_token, logger)
+    websocket_client = start_fyers_websocket(access_token) # No need to pass logger here
     if not websocket_client:
         logger.error("Fyers WebSocket initialization failed. Stopping algo.")
         algo_status_dict["status"] = "stopped"
@@ -691,7 +695,7 @@ def execute_strategy(algo_status_dict, app_logger_instance):
         # If market just opened, reconnect WebSocket
         if not websocket_client or not websocket_client.is_connected:
             logger.info("Market is open, reconnecting Fyers WebSocket.")
-            websocket_client = start_fyers_websocket(access_token, logger)
+            websocket_client = start_fyers_websocket(access_token) # No need to pass logger here
             if not websocket_client:
                 logger.error("Failed to reconnect WebSocket. Skipping this cycle.")
                 time.sleep(10) # Wait a bit before retrying
@@ -708,7 +712,7 @@ def execute_strategy(algo_status_dict, app_logger_instance):
             if current_futures_symbol in last_candle_processed_timestamp and candle_timestamp == last_candle_processed_timestamp[current_futures_symbol]:
                 pass # Already processed this candle, wait for a new one
             else:
-                logger.info(f"Processing new candle for {current_futures_symbol}: {futures_candle}")
+                logger.info(f"Processing new candle for {current_futures_symbol}: {datetime.fromtimestamp(futures_candle[0])}")
                 last_candle_processed_timestamp[current_futures_symbol] = candle_timestamp
                 processed_any_candle_in_this_iteration = True
 
@@ -719,6 +723,8 @@ def execute_strategy(algo_status_dict, app_logger_instance):
                 past_candles_for_indicators = [futures_candle] * num_required_candles 
                 # ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
                 # CRITICAL AREA FOR IMPROVEMENT: Replace this with actual historical candle accumulation.
+                # For now, if you are testing, you might need to manually ensure enough "mock" candles are passed
+                # or wait for sufficient tick data to accumulate.
 
 
                 # --- Strategy Logic ---
@@ -729,8 +735,9 @@ def execute_strategy(algo_status_dict, app_logger_instance):
                     past_candles_for_indicators, FAST_MA_PERIOD, SLOW_MA_PERIOD, SIGNAL_PERIOD
                 )
 
-                if not supertrend_values or not macd_line or not supertrend_trend or not signal_line or not macd_histogram:
-                    logger.warning(f"Indicators not calculated for {current_futures_symbol}. Skipping trade signal generation due to insufficient data or calculation error.")
+                if not supertrend_values or not macd_line or not supertrend_trend or not signal_line or not macd_histogram or \
+                   len(supertrend_values) < 1 or len(macd_line) < 1 or len(supertrend_trend) < 1 or len(signal_line) < 1 or len(macd_histogram) < 1:
+                    logger.warning(f"Indicators not calculated for {current_futures_symbol}. Skipping trade signal generation due to insufficient data or calculation error. ST:{len(supertrend_values)}, MACD:{len(macd_line)}")
                     processed_any_candle_in_this_iteration = False 
                     continue
 
@@ -745,8 +752,11 @@ def execute_strategy(algo_status_dict, app_logger_instance):
                 logger.info(f"Strategy check for {current_futures_symbol}: ST: {latest_supertrend:.2f}, Trend: {latest_supertrend_trend}, MACD: {latest_macd_line:.2f}, Signal: {latest_signal_line:.2f}, Hist: {latest_macd_histogram:.2f}")
 
                 trade_signal = None
+                # Check for MACD Crossover and Histogram confirmation with Supertrend direction
+                # Supertrend Up, MACD Crosses Above Signal, Histogram positive
                 if latest_supertrend_trend == 1 and latest_macd_line > latest_signal_line and latest_macd_histogram > 0:
                     trade_signal = 'BUY'
+                # Supertrend Down, MACD Crosses Below Signal, Histogram negative
                 elif latest_supertrend_trend == -1 and latest_macd_line < latest_signal_line and latest_macd_histogram < 0:
                     trade_signal = 'SELL'
                 
@@ -863,25 +873,9 @@ def get_current_spot_price(symbol):
 
 # --- Initial Setup for direct run (for testing purposes) ---
 if __name__ == "__main__":
-    # When running directly, use SimpleLogger and simulate Flask app context
+    # When running directly, use the configured logging system
     print("Running Jannat Algo Engine directly for testing.")
     
-    # Simulate an app_logger for direct execution
-    class MockAppLogger:
-        def info(self, message):
-            print(f"[INFO][AppLogger] {datetime.now().strftime('%H:%M:%S')} - {message}")
-        def warning(self, message):
-            print(f"[WARNING][AppLogger] {datetime.now().strftime('%H:%M:%S')} - {message}")
-        def error(self, message, exc_info=False):
-            print(f"[ERROR][AppLogger] {datetime.now().strftime('%H:%M:%S')} - {message}")
-            if exc_info:
-                import traceback
-                traceback.print_exc()
-        def debug(self, message):
-            print(f"[DEBUG][AppLogger] {datetime.now().strftime('%H:%M:%S')} - {message}")
-    
-    mock_app_logger = MockAppLogger()
-
     # Simulate algo_status_dict for direct execution
     mock_algo_status_dict = {"status": "running", "last_update": datetime.now().isoformat()}
 
@@ -902,4 +896,4 @@ if __name__ == "__main__":
             json.dump({"access_token": "YOUR_DUMMY_FYERS_ACCESS_TOKEN_FOR_TESTING_ONLY"}, f)
         print(f"Created dummy access token file at {ACCESS_TOKEN_STORAGE_FILE}. Replace with real token for live trading.")
 
-    execute_strategy(mock_algo_status_dict, mock_app_logger)
+    execute_strategy(mock_algo_status_dict, None) # Pass None for app_logger_instance as it's not used
