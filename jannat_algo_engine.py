@@ -82,35 +82,52 @@ logger = SimpleLogger() # Default logger, will be overridden by Flask's app.logg
 
 
 # --- Fyers WebSocket Data Handlers ---
-def on_message(message):
+# --- Fyers WebSocket Data Handlers ---
+# MODIFIED: Using *args, **kwargs to accept any number of arguments
+def on_message(*args, **kwargs):
     """
     Callback function to process incoming messages from Fyers WebSocket.
     Processes both tick data and general messages.
     """
     global latest_prices, logger
+    logger.debug(f"on_message args: {args}, kwargs: {kwargs}") # Log arguments for inspection
+    
+    # Assuming the first argument is the message dictionary if only one is passed
+    message = args[0] if args else {} 
+
     if 'symbol' in message and 'ltp' in message:
         latest_prices[message['symbol']] = message['ltp']
         logger.debug(f"Received tick for {message['symbol']}: LTP = {message['ltp']}")
-        # This will also populate symbol_ticks for candle reconstruction
-        on_ticks_callback(websocket_client, [message]) # Pass message as a list of one tick
+        on_ticks_callback(websocket_client, [message])
     elif 's' in message and message['s'] == 'ok' and 'msg' in message:
         logger.info(f"WebSocket Message: {message['msg']}")
     else:
         logger.debug(f"Received non-tick WebSocket message: {message}")
 
-def on_error(message):
+# MODIFIED: Using *args, **kwargs to accept any number of arguments
+def on_error(*args, **kwargs):
     global logger
+    logger.error(f"WebSocket Error: {args}, kwargs: {kwargs}") # Log arguments for inspection
+    # Assuming the message is the first argument
+    message = args[0] if args else "Unknown error"
     logger.error(f"WebSocket Error: {message}")
 
-# CORRECTED: on_close now accepts ws, close_code, and close_reason
-def on_close(ws, close_code, close_reason): 
+# MODIFIED: Using *args, **kwargs to accept any number of arguments
+def on_close(*args, **kwargs): 
     global logger
+    logger.info(f"WebSocket connection closed. args: {args}, kwargs: {kwargs}") # Log arguments for inspection
+    # Attempt to extract known arguments for logging if they exist
+    close_code = args[1] if len(args) > 1 else 'N/A'
+    close_reason = args[2] if len(args) > 2 else 'N/A'
     logger.info(f"WebSocket connection closed. Code: {close_code}, Reason: {close_reason}")
 
-# CORRECTED: on_open now accepts ws
-def on_open(ws): 
+# MODIFIED: Using *args, **kwargs to accept any number of arguments
+def on_open(*args, **kwargs): 
     global logger
+    logger.info(f"WebSocket connection opened. args: {args}, kwargs: {kwargs}") # Log arguments for inspection
     logger.info("WebSocket connection opened.")
+
+# ... (rest of your code) ...
 
 # --- Helper Functions ---
 
