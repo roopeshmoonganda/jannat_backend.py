@@ -492,6 +492,7 @@ def start_fyers_websocket(access_token, app_logger_instance):
             on_error=on_error,       # Corrected parameter name
             on_close=on_close,       # Corrected parameter name
             on_connect=on_open,      # Corrected parameter name (used on_open function)
+            # Removed: run_background=True  <--- This line was removed based on previous error
         )
 
         logger.info("Connecting to Fyers WebSocket...")
@@ -679,7 +680,7 @@ def execute_strategy(algo_status_dict, app_logger_instance):
             # Disconnect WebSocket if market is closed to save resources
             if websocket_client and websocket_client.is_connected:
                 logger.info("Market closed, disconnecting Fyers WebSocket.")
-                websocket_client.close()
+                websocket_client.disconnect() # Correct method to close the connection
                 websocket_client = None # Clear client
             time.sleep(60) # Check every minute if market is closed
             continue
