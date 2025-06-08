@@ -91,8 +91,7 @@ def on_message(message):
     if 'symbol' in message and 'ltp' in message:
         latest_prices[message['symbol']] = message['ltp']
         logger.debug(f"Received tick for {message['symbol']}: LTP = {message['ltp']}")
-        # This will also populate symbol_ticks for candle reconstruction
-        on_ticks_callback(websocket_client, [message]) # Pass message as a list of one tick
+        on_ticks_callback(websocket_client, [message])
     elif 's' in message and message['s'] == 'ok' and 'msg' in message:
         logger.info(f"WebSocket Message: {message['msg']}")
     else:
@@ -102,11 +101,11 @@ def on_error(message):
     global logger
     logger.error(f"WebSocket Error: {message}")
 
-def on_close():
+def on_close(ws, event): # CORRECTED: Added 'ws' and 'event' parameters
     global logger
-    logger.info("WebSocket connection closed.")
+    logger.info(f"WebSocket connection closed. Code: {event['code']}, Reason: {event['reason']}")
 
-def on_open(): # Renamed from on_connect for clarity but used as on_connect in FyersDataSocket
+def on_open(ws): # Renamed from on_connect for clarity but used as on_connect in FyersDataSocket
     global logger
     logger.info("WebSocket connection opened.")
 
