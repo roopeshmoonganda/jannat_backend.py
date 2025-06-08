@@ -5,12 +5,12 @@ from datetime import datetime, timedelta
 import requests
 import math
 import numpy as np
-from collections import deque # For storing recent ticks for candle reconstruction
-import threading # For running the algo in a separate thread, if needed by Flask
+from collections import deque
+import threading
 
 # --- Fyers API V3 Imports ---
 from fyers_apiv3 import fyersModel
-from fyers_apiv3.FyersWebsocket import data_ws # Import for data WebSocket client
+from fyers_apiv3.FyersWebsocket import data_ws
 
 # --- Configuration ---
 # Use environment variable for Flask backend URL, default to localhost for testing
@@ -82,8 +82,7 @@ logger = SimpleLogger() # Default logger, will be overridden by Flask's app.logg
 
 
 # --- Fyers WebSocket Data Handlers ---
-# --- Fyers WebSocket Data Handlers ---
-# MODIFIED: Using *args, **kwargs to accept any number of arguments
+# MODIFIED: Using *args, **kwargs to accept any number of arguments for robust logging
 def on_message(*args, **kwargs):
     """
     Callback function to process incoming messages from Fyers WebSocket.
@@ -104,7 +103,7 @@ def on_message(*args, **kwargs):
     else:
         logger.debug(f"Received non-tick WebSocket message: {message}")
 
-# MODIFIED: Using *args, **kwargs to accept any number of arguments
+# MODIFIED: Using *args, **kwargs to accept any number of arguments for robust logging
 def on_error(*args, **kwargs):
     global logger
     logger.error(f"WebSocket Error: {args}, kwargs: {kwargs}") # Log arguments for inspection
@@ -112,7 +111,7 @@ def on_error(*args, **kwargs):
     message = args[0] if args else "Unknown error"
     logger.error(f"WebSocket Error: {message}")
 
-# MODIFIED: Using *args, **kwargs to accept any number of arguments
+# MODIFIED: Using *args, **kwargs to accept any number of arguments for robust logging
 def on_close(*args, **kwargs): 
     global logger
     logger.info(f"WebSocket connection closed. args: {args}, kwargs: {kwargs}") # Log arguments for inspection
@@ -121,13 +120,11 @@ def on_close(*args, **kwargs):
     close_reason = args[2] if len(args) > 2 else 'N/A'
     logger.info(f"WebSocket connection closed. Code: {close_code}, Reason: {close_reason}")
 
-# MODIFIED: Using *args, **kwargs to accept any number of arguments
+# MODIFIED: Using *args, **kwargs to accept any number of arguments for robust logging
 def on_open(*args, **kwargs): 
     global logger
     logger.info(f"WebSocket connection opened. args: {args}, kwargs: {kwargs}") # Log arguments for inspection
     logger.info("WebSocket connection opened.")
-
-# ... (rest of your code) ...
 
 # --- Helper Functions ---
 
@@ -405,6 +402,11 @@ def on_ticks_callback(ws_client, ticks):
     Callback function to process incoming ticks from Fyers WebSocket.
     """
     global symbol_ticks, last_completed_candles, logger
+
+    # Ensure ticks is always a list of dictionaries, even if it's a single dict
+    if isinstance(ticks, dict):
+        ticks = [ticks]
+
     for tick in ticks:
         symbol = tick.get('symbol')
         timestamp_seconds = tick.get('timestamp') 
@@ -450,17 +452,7 @@ def build_candle_from_ticks(symbol):
     current_candle_end_time = current_candle_start_time + timedelta(seconds=CANDLE_RESOLUTION_SECONDS)
 
     # Process ticks that are *older* than or within the *just completed* candle interval.
-    # Collect ticks that fall within the completed candle interval (i.e., time < current_candle_start_time)
-    # This logic assumes ticks arrive roughly in order and attempts to finalize a candle
-    # as soon as its interval ends.
     
-    # This is a critical section for tick processing. A more robust solution for production
-    # would involve a loop that identifies *all* completed candle intervals from the deque
-    # and finalizes them sequentially before returning.
-    
-    # For now, let's simplify to process if the *first* tick in queue is past a candle end,
-    # or if current time is past a candle end and we have some ticks.
-
     ticks_for_completed_candle = deque()
     # Move ticks that belong to a *completed* candle interval (i.e., their timestamp is less than
     # the start time of the *current* candle interval)
@@ -507,11 +499,10 @@ def start_fyers_websocket(access_token, app_logger_instance):
             litemode=False,
             write_to_file=False,
             reconnect=True,
-            on_message=on_message,    # Corrected parameter name
-            on_error=on_error,       # Corrected parameter name
-            on_close=on_close,       # Corrected parameter name
-            on_connect=on_open,      # Corrected parameter name (used on_open function)
-            # Removed: run_background=True  <--- This line was removed based on previous error
+            on_message=on_message,    
+            on_error=on_error,       
+            on_close=on_close,       
+            on_connect=on_open,      
         )
 
         logger.info("Connecting to Fyers WebSocket...")
@@ -655,18 +646,20 @@ def execute_strategy(algo_status_dict, app_logger_instance):
     This is designed to run in a separate thread.
     """
     global logger, websocket_client
-    logger = app_logger_instance
+    logger = app_logger_instance # Use the Flask app's logger
 
     logger.info("Jannat Algo Engine started. Loading capital data...")
     load_capital_data()
     logger.info("Capital data loaded. Attempting Fyers API Setup for WebSocket...")
 
+    # --- Fyers API Setup for WebSocket ---
     access_token = get_fyers_access_token()
     if not access_token:
         logger.error("Cannot start algo: Fyers access token is missing or invalid. Stopping algo.")
         algo_status_dict["status"] = "stopped"
         return
 
+    # Initialize Fyers WebSocket connection
     websocket_client = start_fyers_websocket(access_token, logger)
     if not websocket_client:
         logger.error("Fyers WebSocket initialization failed. Stopping algo.")
@@ -674,35 +667,6 @@ def execute_strategy(algo_status_dict, app_logger_instance):
         return
     
     logger.info("Fyers WebSocket initialized and connected. Entering main algo loop...")
-
-    last_candle_processed_timestamp = {} 
-    
-    current_futures_symbol = get_current_month_futures_symbol()
-    
-    initialize_tick_data_buffers([current_futures_symbol])
-
-    while algo_status_dict["status"] == "running":
-        if not is_market_open():
-            logger.info("Market is closed. Waiting for market open.")
-            if websocket_client and websocket_client.is_connected:
-                logger.info("Market closed, closing Fyers WebSocket connection.")
-                # CORRECTED: Changed .disconnect() to .close_connection()
-                websocket_client.close_connection() 
-                websocket_client = None
-            time.sleep(60) 
-            continue
-        
-        if not websocket_client or not websocket_client.is_connected:
-            logger.info("Market is open, reconnecting Fyers WebSocket.")
-            websocket_client = start_fyers_websocket(access_token, logger)
-            if not websocket_client:
-                logger.error("Failed to reconnect WebSocket. Skipping this cycle.")
-                time.sleep(10)
-                continue
-
-        processed_any_candle_in_this_iteration = False
-        
-        futures_candle = last_completed_candles.get(current_futures_symbol)
 
     # --- Main Algo Loop - Now driven by new candle availability ---
     last_candle_processed_timestamp = {} # Track the timestamp of the last candle we processed for each symbol
@@ -713,20 +677,13 @@ def execute_strategy(algo_status_dict, app_logger_instance):
     # Initialize symbol_ticks for the futures symbol
     initialize_tick_data_buffers([current_futures_symbol])
 
-    # NOTE ON INDICATOR HISTORY:
-    # For accurate indicator calculations (like Supertrend, MACD), you NEED a history of `period` candles.
-    # The `build_candle_from_ticks` function currently only provides the *latest* completed candle.
-    # In a production system, you would maintain a `deque` or list of the last N completed candles
-    # for each symbol (where N is greater than your largest indicator period).
-    # This example proceeds with the latest candle, making indicators less reliable until a history is built.
-
     while algo_status_dict["status"] == "running":
         if not is_market_open():
             logger.info("Market is closed. Waiting for market open.")
             # Disconnect WebSocket if market is closed to save resources
             if websocket_client and websocket_client.is_connected:
-                logger.info("Market closed, disconnecting Fyers WebSocket.")
-                websocket_client.disconnect() # Correct method to close the connection
+                logger.info("Market closed, closing Fyers WebSocket connection.")
+                websocket_client.close_connection() # Correct method to close the connection
                 websocket_client = None # Clear client
             time.sleep(60) # Check every minute if market is closed
             continue
