@@ -1,358 +1,249 @@
-import os
-import json
-from flask import Flask, request, jsonify
-from datetime import datetime, timedelta
+from flask import Flask, jsonify, request, redirect, url_for
 from flask_cors import CORS
 import threading
-from jannat_algo_engine import execute_strategy, get_trade_details, get_capital_data # Corrected: 'execute_strategy', 'get_trade_details', 'get_capital_data' imported
+import json
+import os
+from datetime import datetime, timedelta
+import logging # Import logging module for Flask app
+import sys # Import sys module for stdout
 
-# --- Fyers API V3 Imports ---
-# Make sure you have the latest fyers-apiv3 installed: pip install fyers-apiv3
-from fyers_apiv3 import fyersModel # Correct import for the main Fyers client model (includes SessionModel)
-from fyers_apiv3.FyersWebsocket import data_ws # Correct import for the data WebSocket client
-
+# Import your algo engine functions and its logger
+# Note: The algo_engine_logger is imported but the algo engine
+# is now configured to log directly to sys.stdout and a file.
+# The app.logger will still be used for Flask-specific logs.
+from jannat_algo_engine import execute_strategy, get_trade_details, get_capital_data
 
 app = Flask(__name__)
-CORS(app) # Enable CORS for deployment compatibility
+CORS(app) # Enable CORS for frontend communication
+
+# --- Flask App Logging Configuration ---
+# Get the logger for the Flask app
+app.logger.setLevel(logging.INFO) # Set default log level for Flask app
+# Remove default handler if it exists to avoid duplicate logs in some environments
+if app.logger.handlers:
+    for handler in app.logger.handlers:
+        app.logger.removeHandler(handler)
+        handler.close() # Important: close file handlers to release locks
+
+# Add a StreamHandler to output Flask logs to stdout
+flask_stream_handler = logging.StreamHandler(sys.stdout)
+flask_stream_handler.setFormatter(logging.Formatter('[%(asctime)s] %(levelname)s in %(name)s: %(message)s'))
+app.logger.addHandler(flask_stream_handler)
 
 
-# --- Configuration (Load from Environment Variables for Production) ---
-FYERS_APP_ID = os.environ.get("FYERS_APP_ID", "YOUR_APP_ID_FROM_FYERS")
-FYERS_SECRET_ID = os.environ.get("FYERS_SECRET_ID", "YOUR_SECRET_ID_FROM_FYERS")
-FYERS_REDIRECT_URI = os.environ.get("FYERS_REDIRECT_URI", "https://jannat-backend-py.onrender.com/fyers_auth_callback") # Default to Render URL if not set
-FYERS_CLIENT_ID = os.environ.get("FYERS_CLIENT_ID", f"{FYERS_APP_ID}-100") # Typically App ID + "-100"
+# --- Configuration (ensure this matches jannat_algo_engine.py) ---
+# This path must match the persistent disk mount path configured in Render
+PERSISTENT_DISK_BASE_PATH = os.environ.get("PERSISTENT_DISK_PATH", "/var/data")
+ACCESS_TOKEN_STORAGE_FILE = os.path.join(PERSISTENT_DISK_BASE_PATH, "fyers_access_token.json")
+TRADE_LOG_FILE = os.path.join(PERSISTENT_DISK_BASE_PATH, "jannat_trade_log.json") # Assuming this is where past trades are saved
+ALGO_ENGINE_LOG_FILE = os.path.join(PERSISTENT_DISK_BASE_PATH, "jannat_algo_engine.log")
 
-# Global variable to track if algo is running (for frontend polling)
-algo_running_status = {"status": "stopped", "last_update": None}
-algo_thread = None # To hold the reference to the algo thread
+# --- Fyers API Credentials (from environment variables) ---
+FYERS_APP_ID = os.environ.get("FYERS_APP_ID")
+FYERS_SECRET_ID = os.environ.get("FYERS_SECRET_ID")
+FYERS_REDIRECT_URI = os.environ.get("FYERS_REDIRECT_URI") # This should point to your Render backend URL, e.g., https://your-service.onrender.com/fyers_auth_callback
 
+# Global dictionary to control algo thread status
+algo_status_dict = {"status": "stopped", "last_update": datetime.now().isoformat()}
+algo_thread = None # Global variable to hold the algo thread instance
 
-@app.route('/')
-def home():
-    return "Jannat Algo Backend is running!"
+# --- Fyers Authentication Endpoints ---
+@app.route('/login')
+def login():
+    """Initiates the Fyers authentication process."""
+    if not FYERS_APP_ID or not FYERS_REDIRECT_URI:
+        app.logger.error("Fyers APP_ID or REDIRECT_URI not set in environment variables.")
+        return jsonify({"error": "Fyers API credentials not configured"}), 500
 
-@app.route('/generate_auth_url', methods=['GET'])
-def generate_auth_url():
+    # Assuming fyersModel is imported and available, it's used for generating login URL
+    # This requires an instance of FyersModel for session handling, which is usually created during token generation
+    # For login URL, we need to create a temporary session model
     try:
+        from fyers_apiv3 import fyersModel # Import here to avoid circular dependency if algo_engine imports app.py parts
         session = fyersModel.SessionModel(
-            client_id=FYERS_CLIENT_ID,
-            secret_key=FYERS_SECRET_ID,
+            client_id=FYERS_APP_ID,
             redirect_uri=FYERS_REDIRECT_URI,
             response_type='code',
-            state='sample_state'
+            state='sample_state', # A state parameter to prevent CSRF, can be dynamic
+            secret_key=FYERS_SECRET_ID, # Secret key needed for token generation, but often for authcode only client_id/redirect_uri are exposed
+            grant_type='authorization_code'
         )
-        auth_url = session.generate_authcode()
-        return jsonify({"success": True, "auth_url": auth_url}), 200
+        generate_authcode_url = session.generate_authcode()
+        app.logger.info(f"Redirecting for Fyers authentication: {generate_authcode_url}")
+        return redirect(generate_authcode_url)
     except Exception as e:
-        app.logger.error(f"Error generating auth URL: {e}")
-        return jsonify({"success": False, "message": f"Error generating auth URL: {e}"}), 500
+        app.logger.error(f"Error generating Fyers authcode URL: {e}")
+        return jsonify({"error": f"Failed to generate Fyers login URL: {e}"}), 500
 
-@app.route('/fyers_auth_callback', methods=['GET'])
+
+@app.route('/fyers_auth_callback')
 def fyers_auth_callback():
+    """Handles the callback from Fyers after successful authentication."""
     auth_code = request.args.get('auth_code')
     if not auth_code:
-        return jsonify({"success": False, "message": "Auth code not found in callback."}), 400
+        error = request.args.get('error')
+        app.logger.error(f"Fyers authentication failed or no auth_code received. Error: {error}")
+        return jsonify({"status": "Failed", "message": f"Authentication failed: {error}"}), 400
+
+    app.logger.info(f"Received auth_code: {auth_code}")
 
     try:
+        from fyers_apiv3 import fyersModel
         session = fyersModel.SessionModel(
-            client_id=FYERS_CLIENT_ID,
+            client_id=FYERS_APP_ID,
             secret_key=FYERS_SECRET_ID,
             redirect_uri=FYERS_REDIRECT_URI,
             response_type='code',
-            state='sample_state'
+            grant_type='authorization_code'
         )
         session.set_token(auth_code)
-        response = session.generate_access_token()
+        response = session.generate_token()
 
-        if response.get('s') == 'ok':
-            access_token = response['access_token']
-            # Save access token to a file (or database)
-            with open('fyers_access_token.json', 'w') as f:
+        if response.get("code") == 200 and response.get("access_token"):
+            access_token = response["access_token"]
+            app.logger.info("Access token generated successfully.")
+
+            # Ensure the directory exists before saving
+            os.makedirs(os.path.dirname(ACCESS_TOKEN_STORAGE_FILE), exist_ok=True)
+            with open(ACCESS_TOKEN_STORAGE_FILE, 'w') as f:
                 json.dump({"access_token": access_token}, f)
-            return jsonify({"success": True, "message": "Access token retrieved and saved."}), 200
+            app.logger.info(f"Access token saved to {ACCESS_TOKEN_STORAGE_FILE}")
+            return jsonify({"status": "Success", "message": "Fyers authenticated and token saved."}), 200
         else:
             app.logger.error(f"Failed to generate access token: {response}")
-            return jsonify({"success": False, "message": f"Failed to generate access token: {response.get('message', 'Unknown error')}"}), 500
+            return jsonify({"status": "Failed", "message": f"Failed to generate access token: {response.get('message', 'Unknown error')}"}), 500
     except Exception as e:
-        app.logger.error(f"Error in Fyers auth callback: {e}")
-        return jsonify({"success": False, "message": f"Internal server error in auth callback: {e}"}), 500
+        app.logger.error(f"Error during Fyers token generation: {e}")
+        return jsonify({"status": "Error", "message": f"Token generation error: {e}"}), 500
 
-@app.route('/validate_credentials', methods=['GET'])
-def validate_credentials():
-    try:
-        # Check if access token exists and is valid
-        if not os.path.exists('fyers_access_token.json'):
-            return jsonify({"status": "error", "message": "Access token not found. Please authenticate."}), 401
-
-        with open('fyers_access_token.json', 'r') as f:
-            token_data = json.load(f)
-            access_token = token_data.get('access_token')
-
-        if not access_token:
-            return jsonify({"status": "error", "message": "Access token is empty. Please re-authenticate."}), 401
-
-        fyers_api_client = fyersModel.FyersModel(
-            client_id=FYERS_CLIENT_ID,
-            is_token=True,
-            token=access_token,
-            log_path=os.getcwd()
-        )
-        profile_info = fyers_api_client.get_profile() # Test API call to validate token
-
-        if profile_info and profile_info.get('s') == 'ok':
-            return jsonify({"status": "success", "message": "Fyers credentials are valid."}), 200
-        else:
-            return jsonify({"status": "error", "message": f"Invalid Fyers credentials or token expired: {profile_info.get('message', 'Unknown error')}"}), 401
-    except Exception as e:
-        app.logger.error(f"Error validating credentials: {e}")
-        return jsonify({"status": "error", "message": f"Internal server error validating credentials: {e}"}), 500
-
-@app.route('/save_and_validate_credentials', methods=['POST'])
-def save_and_validate_credentials():
-    data = request.get_json()
-    client_id = data.get('client_id')
-    secret_key = data.get('secret_key')
-    redirect_uri = data.get('redirect_uri')
-
-    if not all([client_id, secret_key, redirect_uri]):
-        return jsonify({"success": False, "message": "Missing client_id, secret_key, or redirect_uri"}), 400
-
-    # For simplicity, we just return an auth URL here.
-    # In a real scenario, you might save these temporarily or use them to generate the URL.
-    # For this backend, we are already expecting them from env variables.
-    # This route primarily serves to return the auth_url for the frontend to open.
-    try:
-        # Use provided client_id and secret_key for session model to generate auth URL
-        session = fyersModel.SessionModel(
-            client_id=client_id, # Use provided client_id
-            secret_key=secret_key, # Use provided secret_key
-            redirect_uri=redirect_uri, # Use provided redirect_uri
-            response_type='code',
-            state='sample_state'
-        )
-        auth_url = session.generate_authcode()
-        return jsonify({"success": True, "auth_url": auth_url, "message": "Auth URL generated. Please complete Fyers authentication."}), 200
-    except Exception as e:
-        app.logger.error(f"Error in /save_and_validate_credentials: {e}")
-        return jsonify({"success": False, "message": f"Error generating auth URL with provided credentials: {e}"}), 500
-
-
-@app.route('/data/ohlcv', methods=['POST'])
-def get_ohlcv_data():
-    data = request.get_json()
-    symbol = data.get('symbol')
-    resolution = data.get('resolution')
-    range_from = data.get('range_from')
-    range_to = data.get('range_to')
-
-    if not all([symbol, resolution, range_from, range_to]):
-        return jsonify({"success": False, "message": "Missing symbol, resolution, range_from, or range_to"}), 400
-
-    try:
-        with open('fyers_access_token.json', 'r') as f:
-            token_data = json.load(f)
-            access_token = token_data.get('access_token')
-
-        if not access_token:
-            return jsonify({"success": False, "message": "Access token not found. Cannot fetch data."}), 401
-
-        fyers_api_client = fyersModel.FyersModel(
-            client_id=FYERS_CLIENT_ID,
-            is_token=True,
-            token=access_token,
-            log_path=os.getcwd()
-        )
-
-        # Convert date strings to datetime objects for Fyers API
-        from_date_obj = datetime.strptime(range_from, '%Y-%m-%d')
-        to_date_obj = datetime.strptime(range_to, '%Y-%m-%d')
-
-        history_data = {
-            "symbol": symbol,
-            "resolution": resolution,
-            "date_format": "1", # 1 for historical data
-            "range_from": from_date_obj.strftime('%Y-%m-%d'),
-            "range_to": to_date_obj.strftime('%Y-%m-%d'),
-            "cont_flag": "1" # Continue flag for fetching more data if available
-        }
-        response = fyers_api_client.history(data=history_data)
-
-        if response.get('s') == 'ok':
-            return jsonify({"success": True, "data": response.get('candles', [])}), 200
-        else:
-            return jsonify({"success": False, "message": response.get('message', 'Failed to fetch OHLCV data')}), 500
-    except Exception as e:
-        app.logger.error(f"Error fetching OHLCV data: {e}")
-        return jsonify({"success": False, "message": f"Internal server error fetching OHLCV data: {e}"}), 500
-
-
-@app.route('/data/quote', methods=['POST'])
-def get_quote_data():
-    data = request.get_json()
-    symbols = data.get('symbols') # Expects a list of symbols
-
-    if not symbols:
-        return jsonify({"success": False, "message": "Missing symbols"}), 400
-
-    try:
-        with open('fyers_access_token.json', 'r') as f:
-            token_data = json.load(f)
-            access_token = token_data.get('access_token')
-
-        if not access_token:
-            return jsonify({"success": False, "message": "Access token not found. Cannot fetch data."}), 401
-
-        fyers_api_client = fyersModel.FyersModel(
-            client_id=FYERS_CLIENT_ID,
-            is_token=True,
-            token=access_token,
-            log_path=os.getcwd()
-        )
-
-        quote_data = {"symbols": ",".join(symbols)} # Fyers API expects comma-separated string
-        response = fyers_api_client.quotes(data=quote_data)
-
-        if response.get('s') == 'ok':
-            return jsonify({"success": True, "data": response.get('d', [])}), 200
-        else:
-            return jsonify({"success": False, "message": response.get('message', 'Failed to fetch quote data')}), 500
-    except Exception as e:
-        app.logger.error(f"Error fetching quote data: {e}")
-        return jsonify({"success": False, "message": f"Internal server error fetching quote data: {e}"}), 500
-
-
-@app.route('/trade/execute', methods=['POST'])
-def execute_trade():
-    trade_details = request.get_json()
-    symbol = trade_details.get('symbol')
-    signal = trade_details.get('signal') # BUY or SELL
-    entry_price = trade_details.get('entryPrice')
-    target = trade_details.get('target')
-    stop_loss = trade_details.get('stopLoss')
-    quantity = trade_details.get('quantity')
-    product_type = trade_details.get('product_type') # e.g., "MIS", "CNC", "INTRADAY"
-    order_type = trade_details.get('order_type') # e.g., "LIMIT", "MARKET"
-    trade_mode = trade_details.get('trade_mode', 'PAPER') # PAPER or LIVE
-
-    if not all([symbol, signal, quantity, product_type, order_type]):
-        return jsonify({"success": False, "message": "Missing required trade parameters."}), 400
-
-    if trade_mode == 'PAPER':
-        try:
-            # Simulate paper trade success
-            # Here you would typically log the paper trade in your trade log file
-            # For simplicity, returning a simulated success
-            trade_id = f"PAPER_TRADE_{datetime.now().strftime('%Y%m%d%H%M%S')}"
-            app.logger.info(f"Paper trade simulated for {symbol} ({signal}) - Trade ID: {trade_id}")
-            return jsonify({"success": True, "message": "Paper trade simulated successfully.", "orderId": trade_id}), 200
-        except Exception as e:
-            app.logger.error(f"Error simulating paper trade: {e}")
-            return jsonify({"success": False, "message": f"Internal server error simulating paper trade: {e}"}), 500
-    elif trade_mode == 'LIVE':
-        try:
-            with open('fyers_access_token.json', 'r') as f:
-                token_data = json.load(f)
-                access_token = token_data.get('access_token')
-
-            if not access_token:
-                return jsonify({"success": False, "message": "Access token not found. Cannot place live trade."}), 401
-
-            fyers_api_client = fyersModel.FyersModel(
-                client_id=FYERS_CLIENT_ID,
-                is_token=True,
-                token=access_token,
-                log_path=os.getcwd()
-            )
-
-            side = 1 if signal.upper() == 'BUY' else -1 # 1 for BUY, -1 for SELL
-            limit_price = float(entry_price) if order_type.upper() == 'LIMIT' else 0 # Set limit price if order type is LIMIT
-
-            order_data = {
-                "symbol": symbol,
-                "qty": int(quantity),
-                "type": 2 if order_type.upper() == 'MARKET' else 1, # 1 for LIMIT, 2 for MARKET
-                "side": side,
-                "productType": product_type.upper(), # e.g., "MIS", "CNC"
-                "limitPrice": limit_price,
-                "stopPrice": 0, # Not using stopPrice directly here, SL will be managed by algo
-                "validity": "DAY",
-                "disclosedQty": 0,
-                "offlineOrder": "False"
-            }
-
-            response = fyers_api_client.place_order(data=order_data)
-
-            if response.get('s') == 'ok':
-                order_id = response['id']
-                app.logger.info(f"Live trade placed for {symbol} ({signal}) - Fyers Order ID: {order_id}")
-                return jsonify({"success": True, "message": "Live trade placed successfully.", "orderId": order_id}), 200
-            else:
-                app.logger.error(f"Fyers order placement error: {response.get('message', 'Unknown error')}")
-                return jsonify({"success": False, "message": response.get('message', 'Failed to place live order.')}), 500
-        except Exception as e:
-            app.logger.error(f"Error placing live trade: {e}")
-            return jsonify({"success": False, "message": f"Internal server error placing live trade: {e}"}), 500
-    else:
-        return jsonify({"success": False, "message": "Invalid trade mode specified."}), 400
-
+# --- Algo Engine Control Endpoints ---
 @app.route('/start_algo', methods=['GET', 'POST'])
 def start_algo():
-    global algo_running_status, algo_thread
+    global algo_thread, algo_status_dict
+    # Check if thread is already running or if status is 'running' but thread is dead
+    if algo_status_dict["status"] == "running" and algo_thread and algo_thread.is_alive():
+        app.logger.info("Attempted to start algo, but it's already running.")
+        return jsonify({"status": "Algo already running"}), 200
+
     try:
-        if algo_thread and algo_thread.is_alive():
-            return jsonify({"status": "Algo Already Running", "message": "The algorithmic trading engine is already active."}), 200
-
-        # Pass the global status dict and app logger to the algo engine
-        threading.Thread(target=execute_strategy, args=(algo_running_status, app.logger,)).start()
-        algo_running_status["status"] = "running"
-        algo_running_status["last_update"] = datetime.now().isoformat()
-        app.logger.info("Algorithmic trading engine started via API.")
-        return jsonify({"status": "Algo Started", "message": "Algorithmic trading engine initiated successfully."}), 200
+        # The algo_status_dict allows the algo engine to check its own status and stop
+        # app.logger is passed for compatibility, but the algo engine now uses its own configured logger
+        algo_thread = threading.Thread(target=execute_strategy, args=(algo_status_dict, app.logger,))
+        algo_thread.daemon = True # Allows Flask app to exit gracefully even if algo thread is running
+        algo_thread.start()
+        algo_status_dict["status"] = "running"
+        algo_status_dict["last_update"] = datetime.now().isoformat()
+        app.logger.info("Algo engine started in background thread.")
+        return jsonify({"status": "Algo Started"}), 200
     except Exception as e:
-        app.logger.error(f"Error starting algo: {e}")
-        return jsonify({"status": "error", "message": f"Failed to start algo: {e}"}), 500
+        app.logger.error(f"Error starting algo: {e}", exc_info=True) # Log traceback
+        # Reset status if starting failed
+        algo_status_dict["status"] = "stopped"
+        return jsonify({"status": "Error", "message": f"Failed to start algo: {e}"}), 500
 
-# --- NEW ENDPOINTS FOR FRONTEND ---
-@app.route('/current_status', methods=['GET'])
-def get_current_status():
-    """
-    Returns the current status of the algo and any active trade details.
-    """
-    global algo_running_status
-    try:
-        current_trade_details = get_trade_details() # This will be from jannat_algo_engine
-        current_capital_data = get_capital_data() # This will be from jannat_algo_engine
+@app.route('/stop_algo', methods=['GET', 'POST'])
+def stop_algo():
+    global algo_status_dict, algo_thread
+    if algo_status_dict["status"] == "stopped":
+        app.logger.info("Attempted to stop algo, but it's already stopped.")
+        return jsonify({"status": "Algo already stopped"}), 200
 
-        response_data = {
-            "algo_status": algo_running_status["status"],
-            "algo_last_update": algo_running_status["last_update"],
-            "current_trade": current_trade_details,
-            "capital_data": current_capital_data
-        }
-        return jsonify(response_data), 200
-    except Exception as e:
-        app.logger.error(f"Error fetching current status: {e}")
-        return jsonify({"error": "Failed to retrieve current status", "message": str(e)}), 500
+    app.logger.info("Stopping algo engine initiated.")
+    algo_status_dict["status"] = "stopped" # This signal will stop the loop in execute_strategy
+    algo_status_dict["last_update"] = datetime.now().isoformat()
 
-@app.route('/trade_history', methods=['GET'])
-def get_trade_history():
-    """
-    Returns the full trade log from jannat_trade_log.json.
-    """
-    TRADE_LOG_FILE = os.path.join(os.environ.get("PERSISTENT_DISK_PATH", "."), "jannat_trade_log.json")
+    # Optional: Wait for the thread to actually finish for graceful shutdown.
+    # Be careful with `join()` in a web server context as it can block the request.
+    # if algo_thread and algo_thread.is_alive():
+    #     app.logger.info("Waiting for algo thread to terminate...")
+    #     algo_thread.join(timeout=5) # Wait up to 5 seconds for thread to finish
+    #     if algo_thread.is_alive():
+    #         app.logger.warning("Algo thread did not terminate gracefully within timeout.")
+    #     else:
+    #         app.logger.info("Algo thread terminated gracefully.")
+
+    return jsonify({"status": "Algo Stopped"}), 200
+
+
+# --- Frontend Data Endpoints ---
+
+@app.route('/api/status', methods=['GET'])
+def get_algo_status():
+    """Returns the current status of the algo engine."""
+    global algo_status_dict
+    return jsonify(algo_status_dict), 200
+
+@app.route('/api/capital', methods=['GET'])
+def get_current_capital():
+    """Returns current capital data (balance, pnl_today, etc.)."""
+    capital_data = get_capital_data() # Assuming this function exists in jannat_algo_engine
+    return jsonify(capital_data), 200
+
+@app.route('/api/active_trades', methods=['GET'])
+def get_current_active_trades():
+    """Returns a list of currently active trades."""
+    active_trades = get_trade_details() # Assuming this function exists in jannat_algo_engine
+    return jsonify(active_trades), 200
+
+@app.route('/api/past_trades', methods=['GET'])
+def get_historical_trades():
+    """Returns a list of historical (closed) trades from the JSON log file."""
     if not os.path.exists(TRADE_LOG_FILE):
-        return jsonify({"history": [], "message": "Trade log file not found."}), 200
+        return jsonify([]), 200 # Return empty list if file doesn't exist
+
     try:
         with open(TRADE_LOG_FILE, 'r') as f:
-            trade_history = json.load(f)
-        return jsonify({"history": trade_history}), 200
+            content = f.read()
+            if not content: # Handle empty file
+                return jsonify([]), 200
+            trade_log = json.loads(content)
+            # Ensure proper date/time format for frontend if needed, e.g., convert to ISO format
+            # For simplicity, returning as is, assuming frontend handles date parsing
+            return jsonify(trade_log), 200
     except json.JSONDecodeError:
-        app.logger.error("Error decoding jannat_trade_log.json. File might be empty or corrupted.")
-        return jsonify({"history": [], "message": "Error reading trade log. File might be corrupted."}), 200
+        app.logger.error(f"Error decoding trade log JSON at {TRADE_LOG_FILE}. File might be corrupted.", exc_info=True)
+        return jsonify([]), 500
     except Exception as e:
-        app.logger.error(f"Error fetching trade history: {e}")
-        return jsonify({"error": "Failed to retrieve trade history", "message": str(e)}), 500
+        app.logger.error(f"Error reading trade log: {e}", exc_info=True)
+        return jsonify([]), 500
+
+@app.route('/api/logs', methods=['GET'])
+def get_production_logs():
+    """Reads and returns the last N lines of the algo engine's log file."""
+    num_lines = request.args.get('lines', default=500, type=int) # Default to 500 lines for logs
+    
+    logs = []
+    if os.path.exists(ALGO_ENGINE_LOG_FILE):
+        try:
+            with open(ALGO_ENGINE_LOG_FILE, 'r') as f:
+                all_lines = f.readlines()
+                logs = [line.strip() for line in all_lines[-num_lines:]]
+        except Exception as e:
+            app.logger.error(f"Error reading algo engine log file: {e}", exc_info=True)
+            logs = [f"Error reading logs: {e}"] # Return error message within logs
+    else:
+        logs = [f"Algo engine log file not found at {ALGO_ENGINE_LOG_FILE}. Ensure it's configured to write to persistent disk."]
+
+    return jsonify({"logs": logs}), 200 # Return logs in a dictionary under 'logs' key
 
 
+# --- Flask Entry Point ---
 if __name__ == '__main__':
-    app.run(debug=True, host='0.0.0.0', port=os.environ.get('PORT', 5000))
+    # Ensure directories for persistent data are created on startup
+    app.logger.info(f"Ensuring persistent disk path exists: {PERSISTENT_DISK_BASE_PATH}")
+    os.makedirs(PERSISTENT_DISK_BASE_PATH, exist_ok=True)
+    os.makedirs(os.path.dirname(ACCESS_TOKEN_STORAGE_FILE), exist_ok=True)
+    os.makedirs(os.path.dirname(TRADE_LOG_FILE), exist_ok=True)
+    os.makedirs(os.path.dirname(ALGO_ENGINE_LOG_FILE), exist_ok=True)
+
+    # For local testing, ensure a dummy token exists if you're not going through auth every time
+    # In a production environment, this file should be created via the /login flow
+    if not os.path.exists(ACCESS_TOKEN_STORAGE_FILE):
+        app.logger.warning(f"Access token file not found at {ACCESS_TOKEN_STORAGE_FILE}. "
+                           "Algo will not run without a valid Fyers access token. "
+                           "Please authenticate via /login endpoint.")
+        # You might create a dummy file for local development if you manually set the token for debugging
+        # with open(ACCESS_TOKEN_STORAGE_FILE, 'w') as f:
+        #     json.dump({"access_token": "YOUR_DUMMY_FYERS_ACCESS_TOKEN_FOR_DEV"}, f)
+
+    app.run(host='0.0.0.0', port=os.environ.get('PORT', 5000))
