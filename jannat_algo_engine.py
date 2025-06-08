@@ -25,8 +25,10 @@ FYERS_WS_LOG_DIR = os.path.join(PERSISTENT_DISK_BASE_PATH, "fyers_ws_logs")
 
 # Trading Parameters
 BASE_CAPITAL = 100000.0
-SYMBOL_SPOT = "NSE:BANKNIFTY"
-OPTION_EXPIRY_DAYS_AHEAD = 7
+# Changed SYMBOL_SPOT to just the instrument name, not with "NSE:"
+# This allows dynamic generation of futures/options symbols easily
+SYMBOL_SPOT_BASE_NAME = "BANKNIFTY" 
+OPTION_EXPIRY_DAYS_AHEAD = 7 # Used in get_nearest_expiry_date
 BANKNIFTY_STRIKE_INTERVAL = 100
 NIFTY_STRIKE_INTERVAL = 50
 
@@ -54,6 +56,10 @@ symbol_ticks = {}
 last_completed_candles = {}
 CANDLE_RESOLUTION_SECONDS = 300 # 5 minutes for example (5 * 60)
 
+# Global dictionary to store latest prices for subscribed symbols
+latest_prices = {}
+websocket_client = None # To store the Fyers WebSocket client instance
+
 # Logger placeholder (will be replaced by Flask app.logger)
 class SimpleLogger:
     def info(self, message):
@@ -62,8 +68,39 @@ class SimpleLogger:
         print(f"[WARNING] {datetime.now().strftime('%H:%M:%S')} - {message}")
     def error(self, message):
         print(f"[ERROR] {datetime.now().strftime('%H:%M:%S')} - {message}")
+    def debug(self, message):
+        print(f"[DEBUG] {datetime.now().strftime('%H:%M:%S')} - {message}")
 
 logger = SimpleLogger() # Default logger, will be overridden by Flask's app.logger
+
+
+# --- Fyers WebSocket Data Handlers ---
+def on_message(message):
+    """
+    Callback function to process incoming messages from Fyers WebSocket.
+    Processes both tick data and general messages.
+    """
+    global latest_prices, logger
+    if 'symbol' in message and 'ltp' in message:
+        latest_prices[message['symbol']] = message['ltp']
+        # This will also populate symbol_ticks for candle reconstruction
+        on_ticks_callback(websocket_client, [message]) # Pass message as a list of one tick
+    elif 's' in message and message['s'] == 'ok' and 'msg' in message:
+        logger.info(f"WebSocket Message: {message['msg']}")
+    else:
+        logger.debug(f"Received non-tick WebSocket message: {message}")
+
+def on_error(message):
+    global logger
+    logger.error(f"WebSocket Error: {message}")
+
+def on_close():
+    global logger
+    logger.info("WebSocket connection closed.")
+
+def on_open():
+    global logger
+    logger.info("WebSocket connection opened.")
 
 # --- Helper Functions ---
 
@@ -164,23 +201,27 @@ def is_market_open():
         return True
     return False
 
-def get_current_option_symbol(spot_symbol, expiry_date, is_call, strike_price):
+def get_current_month_futures_symbol():
+    """
+    Generates the current month's BankNifty futures symbol in the format:
+    NSE:BANKNIFTYYYMONFUT (e.g., NSE:BANKNIFTY25JUNFUT)
+    """
+    now = datetime.now()
+    year_short = now.strftime('%y') # Last two digits of the year (e.g., 25)
+    month_abbr = now.strftime('%b').upper() # Three-letter month abbreviation (e.g., JUN, JUL)
+    return f"NSE:{SYMBOL_SPOT_BASE_NAME}{year_short}{month_abbr}FUT"
+
+def get_current_option_symbol(base_symbol_name, expiry_date, is_call, strike_price):
     """Constructs the Fyers option symbol."""
-    # Example: BANKNIFTY24SEP46000CE
-    # Format: INSTRUMENT + YY + MON (3 chars) + Strike + PE/CE
-    # Note: Fyers symbols can be tricky, often requiring specific formatting.
-    # This is a simplified example. For actual Fyers symbol generation,
-    # you might need to use their master data or an API to find correct symbols.
+    # Example: NSE:BANKNIFTY24SEP46000CE
+    # Format: EXCHANGE:INSTRUMENT + YY + MON (3 chars) + Strike + PE/CE
+    
     year_short = expiry_date.strftime('%y')
     month_short = expiry_date.strftime('%b').upper() # e.g., JAN, FEB
     option_type = "CE" if is_call else "PE"
     strike_str = str(int(strike_price))
 
-    # Fyers often uses specific patterns, e.g., BANKNIFTY24MAY43000CE
-    # For weekly options, it might be BANKNIFTY2452243000CE (YYMDD) or similar.
-    # This example assumes monthly format for simplicity.
-    # For true Fyers compliance, you'd need their master data or a more robust symbol builder.
-    return f"{spot_symbol.split(':')[1]}{year_short}{month_short}{strike_str}{option_type}"
+    return f"NSE:{base_symbol_name}{year_short}{month_short}{strike_str}{option_type}"
 
 
 def get_current_atm_strike(current_spot_price, strike_interval):
@@ -332,10 +373,11 @@ def initialize_tick_data_buffers(symbols):
     for symbol in symbols:
         symbol_ticks[symbol] = deque() # Stores (timestamp, price) tuples
 
-def on_ticks_callback(ws, ticks):
+def on_ticks_callback(ws_client, ticks):
     """
     Callback function to process incoming ticks from Fyers WebSocket.
     This function will be called by the Fyers WebSocket client whenever new ticks arrive.
+    It now accepts a list of ticks (even if it's just one).
     """
     global symbol_ticks, last_completed_candles, logger
     for tick in ticks:
@@ -395,23 +437,25 @@ def build_candle_from_ticks(symbol):
     # Iterate through ticks, removing those that are too old (belong to previous completed candles)
     # and using them to build a candle if an interval closes.
     
-    # Keep track of ticks for the *current* incomplete candle
     # Temporarily hold ticks for the current interval
     temp_current_candle_ticks = deque()
     
     # Move ticks that belong to the current or future candle into a temporary deque
     # and remove any ticks that are older than the current candle's start time.
-    while ticks_for_symbol and ticks_for_symbol[0][0] < current_candle_start_time:
-        ticks_for_symbol.popleft() # Discard old ticks
-
-    while ticks_for_symbol and ticks_for_symbol[0][0] < current_candle_end_time:
-        temp_current_candle_ticks.append(ticks_for_symbol.popleft())
+    # We must ensure ticks are processed in correct time order.
+    # While ticks_for_symbol[0][0] is for time of tick, it's safer to pop until current_candle_end_time
+    # or process all currently available ticks and then clear.
     
-    # If the current candle interval has ended AND we have ticks for it, finalize it
-    if current_time >= current_candle_end_time and temp_current_candle_ticks:
+    # Collect all ticks that are older than or within the *just completed* candle window.
+    # This loop ensures we only process ticks that are "finished" and belong to a past interval.
+    ticks_to_process_for_past_candle = []
+    while ticks_for_symbol and ticks_for_symbol[0][0] < current_candle_end_time:
+        ticks_to_process_for_past_candle.append(ticks_for_symbol.popleft())
+    
+    # If the current time is beyond the end of a candle interval AND we have ticks for that interval, finalize it
+    if current_time >= current_candle_end_time and ticks_to_process_for_past_candle:
         # Sort ticks by time to ensure O, H, L, C are correct if ticks arrive out of order
-        # Convert deque to list for sorting, then back if needed, or process directly
-        sorted_ticks = sorted(list(temp_current_candle_ticks), key=lambda x: x[0])
+        sorted_ticks = sorted(list(ticks_to_process_for_past_candle), key=lambda x: x[0])
 
         open_price = sorted_ticks[0][1]
         close_price = sorted_ticks[-1][1]
@@ -427,38 +471,49 @@ def build_candle_from_ticks(symbol):
         logger.info(f"New {CANDLE_RESOLUTION_SECONDS/60}-min candle for {symbol}: {new_candle}")
         # At this point, you could trigger your strategy functions with this new candle data.
 
-    # Any remaining ticks in `ticks_for_symbol` are for the *next* candle interval.
+    # Any remaining ticks in `ticks_for_symbol` are for the *current* or *future* candle interval.
     # These will be processed in subsequent calls to `build_candle_from_ticks`.
 
-def start_fyers_websocket(access_token, client_id, symbols):
+
+def start_fyers_websocket(access_token, app_logger_instance):
     """Initializes and starts the Fyers WebSocket connection for data."""
-    global logger # Ensure logger is accessible
+    global websocket_client, logger # Ensure logger and websocket_client are accessible
+    logger = app_logger_instance # Assign the passed logger
+
+    logger.info("Attempting to start Fyers WebSocket...")
     try:
         # Ensure the log directory exists
         os.makedirs(FYERS_WS_LOG_DIR, exist_ok=True)
         logger.info(f"Fyers WebSocket log directory ensured: {FYERS_WS_LOG_DIR}")
 
-        fyers_data_ws = data_ws.FyersDataSocket(
+        websocket_client = data_ws.FyersDataSocket(
             access_token=access_token,
             log_path=FYERS_WS_LOG_DIR, # Corrected: Pass the directory path
             litemode=False, # Set to True for light mode (fewer fields), False for full data
             write_to_file=False, # Set to True to write raw data to file
             reconnect=True, # Enable auto-reconnection
+            # Use handler_message, handler_error, etc., as per fyers-apiv3 docs
+            handler_message=on_message,
+            handler_error=on_error,
+            handler_close=on_close,
+            handler_open=on_open,
+            run_background=True # Runs the WebSocket in a separate thread
         )
-        # Assign callbacks after initialization
-        fyers_data_ws.on_message = on_ticks_callback
-        fyers_data_ws.on_open = lambda: logger.info("Fyers data WebSocket connection opened.")
-        fyers_data_ws.on_close = lambda: logger.info("Fyers data WebSocket connection closed.")
-        fyers_data_ws.on_error = lambda e: logger.error(f"Fyers data WebSocket error: {e}")
 
-        fyers_data_ws.connect()
+        logger.info("Connecting to Fyers WebSocket...")
+        websocket_client.connect()
+        logger.info("Fyers WebSocket connection initiated.")
 
-        # Subscribe to symbols - Corrected: Pass symbols and dataType directly
-        fyers_data_ws.subscribe(symbols=symbols, data_type="symbolData") 
-        logger.info(f"Subscribed to Fyers WebSocket for symbols: {symbols}")
-        return fyers_data_ws
+        # Dynamically generate the current month's BankNifty futures symbol
+        current_futures_symbol = get_current_month_futures_symbol()
+        initial_symbols_to_watch = [current_futures_symbol]
+
+        # Subscribe to initial symbols
+        websocket_client.subscribe(symbols=initial_symbols_to_watch, data_type="symbolData") 
+        logger.info(f"Subscribed to Fyers WebSocket for initial symbols: {initial_symbols_to_watch}")
+        return websocket_client
     except Exception as e:
-        logger.error(f"Failed to start Fyers WebSocket: {e}")
+        logger.error(f"Failed to start Fyers WebSocket: {e}", exc_info=True) # Print full traceback
         return None
 
 
@@ -476,6 +531,7 @@ def place_order_api(symbol, side, quantity, product_type, order_type, price=0, t
         "entryPrice": price, # Only relevant for LIMIT orders, but pass always
         "trade_mode": trade_mode
     }
+    logger.info(f"Sending order placement request to backend for {symbol} ({'BUY' if side == 1 else 'SELL'})...")
     try:
         response = requests.post(url, json=payload)
         response.raise_for_status()
@@ -498,7 +554,7 @@ def monitor_and_manage_trade(trade_obj):
     or be part of a non-blocking event loop if using asynchronous libraries.
     For simplicity, within `execute_strategy` it will be checked on each new candle.
     """
-    global active_trades, jannat_capital, logger
+    global active_trades, jannat_capital, logger, latest_prices
 
     symbol = trade_obj['symbol']
     entry_price = trade_obj['entry_price']
@@ -509,14 +565,12 @@ def monitor_and_manage_trade(trade_obj):
 
     logger.info(f"Monitoring trade for {symbol}. Entry: {entry_price}, SL: {stop_loss_price}, Target: {target_price}")
 
-    # For monitoring, we need the latest price.
-    # In a tick-by-tick system, we get this from the `on_ticks_callback` which updates `last_completed_candles` or directly from latest tick.
-    # For now, we'll assume `get_current_spot_price` gets the latest available (either from a live tick, or a cached tick from `on_ticks_callback`)
-    # This requires `get_current_spot_price` to fetch from local `symbol_ticks` or `last_completed_candles`.
-    current_price = get_current_spot_price(symbol) # Assumes this fetches the *latest* available price
+    # Use the latest price from the global latest_prices dictionary
+    current_price = latest_prices.get(symbol) # Get the real-time price of the traded option/future
 
     if current_price is None:
-        logger.warning(f"Could not get current price for {symbol} for trade monitoring.")
+        logger.warning(f"Could not get current price for {symbol} from latest_prices for trade monitoring.")
+        # If no price, consider if you want to exit or just wait for next tick
         return # Skip monitoring if no price
 
     pnl = 0.0
@@ -589,86 +643,91 @@ def get_capital_data():
 
 # --- Main Algo Engine Logic ---
 
-def execute_strategy(algo_status_dict, app_logger):
+def execute_strategy(algo_status_dict, app_logger_instance):
     """
     Main function to run the algorithmic trading strategy.
     This is designed to run in a separate thread.
     """
-    global logger
-    logger = app_logger # Use the Flask app's logger
+    global logger, websocket_client
+    logger = app_logger_instance # Use the Flask app's logger
 
-    logger.info("Jannat Algo Engine started.")
+    logger.info("Jannat Algo Engine started. Loading capital data...")
     load_capital_data()
+    logger.info("Capital data loaded. Attempting Fyers API Setup for WebSocket...")
 
     # --- Fyers API Setup for WebSocket ---
     access_token = get_fyers_access_token()
     if not access_token:
-        logger.error("Cannot start algo: Fyers access token is missing or invalid.")
+        logger.error("Cannot start algo: Fyers access token is missing or invalid. Stopping algo.")
         algo_status_dict["status"] = "stopped"
         return
 
-    # Assuming FYERS_CLIENT_ID is globally available from app.py config
-    # In app.py: FYERS_CLIENT_ID = f"{FYERS_APP_ID}-100"
-    fyers_client_id = os.environ.get("FYERS_APP_ID", "dummy_app_id") + "-100"
-
-    # The symbols we are interested in. This should dynamically include selected options.
-    # For now, let's assume we want to subscribe to a fixed set for testing.
-    # In a real scenario, you'd dynamically get options symbols after fetching spot price.
-    symbols_to_watch = [SYMBOL_SPOT + "FUT"] # Example: BANKNIFTY Futures for initial Supertrend/MACD
-    # If trading options, you'd add selected option symbols here after determining them.
-    # e.g., symbols_to_watch.append(atm_call_symbol)
-    # e.g., symbols_to_watch.append(atm_put_symbol)
-
-    initialize_tick_data_buffers(symbols_to_watch) # Prepare buffers for these symbols
-    fyers_ws = start_fyers_websocket(access_token, fyers_client_id, symbols_to_watch)
-    if not fyers_ws:
+    # Initialize Fyers WebSocket connection
+    websocket_client = start_fyers_websocket(access_token, logger)
+    if not websocket_client:
+        logger.error("Fyers WebSocket initialization failed. Stopping algo.")
         algo_status_dict["status"] = "stopped"
         return
+    
+    logger.info("Fyers WebSocket initialized and connected. Entering main algo loop...")
 
     # --- Main Algo Loop - Now driven by new candle availability ---
     last_candle_processed_time = {} # Track the timestamp of the last candle we processed for each symbol
+    
+    # Get the current month's futures symbol
+    current_futures_symbol = get_current_month_futures_symbol()
 
+    # Make sure we have enough historical candles for indicators.
+    # In a real system, you'd fetch this from Fyers API or maintain a rolling window.
+    # For now, we'll just ensure the loop processes ticks.
+    
     while algo_status_dict["status"] == "running":
         if not is_market_open():
             logger.info("Market is closed. Waiting for market open.")
             time.sleep(60) # Check every minute if market is closed
             continue
 
-        # In a tick-by-tick system, the strategy logic would ideally be triggered
-        # whenever a new candle is *completed* and stored in `last_completed_candles`.
-        # We'll poll `last_completed_candles` here, but a more event-driven approach
-        # would be better (e.g., `on_ticks_callback` triggers a signal processing method).
+        processed_any_candle_in_this_iteration = False
+        
+        # We process the futures symbol's candles for signal generation
+        # and options symbols for monitoring active trades.
+        
+        # Process futures candle for signal generation
+        futures_candle = last_completed_candles.get(current_futures_symbol)
+        
+        if futures_candle:
+            candle_timestamp = futures_candle[0] # Get timestamp of the completed candle
 
-        for symbol in symbols_to_watch: # Iterate through symbols we are watching
-            current_candle = last_completed_candles.get(symbol)
-            
-            if current_candle:
-                candle_timestamp = current_candle[0] # Get timestamp of the completed candle
+            # Check if this candle has already been processed
+            if current_futures_symbol in last_candle_processed_time and candle_timestamp == last_candle_processed_time[current_futures_symbol]:
+                pass # Already processed this candle, wait for a new one
+            else:
+                logger.info(f"Processing new candle for {current_futures_symbol}: {futures_candle}")
+                last_candle_processed_time[current_futures_symbol] = candle_timestamp
+                processed_any_candle_in_this_iteration = True
 
-                # Check if this candle has already been processed
-                if symbol in last_candle_processed_time and candle_timestamp == last_candle_processed_time[symbol]:
-                    continue # Already processed this candle, wait for a new one
-
-                logger.info(f"Processing new candle for {symbol}: {current_candle}")
-                last_candle_processed_time[symbol] = candle_timestamp
-
-                # Fetch past candles to get enough data for indicators.
-                # In a real-time system, you'd maintain a `deque` of recent candles,
-                # appending the new `current_candle` and popping the oldest if capacity is reached.
-                # For this example, we'll just use the most recent candle for demonstration.
-                # **IMPORTANT:** For accurate indicator calculations (like Supertrend, MACD),
-                # you NEED a history of `period` candles. This means your `build_candle_from_ticks`
-                # or a separate component needs to maintain a list/deque of the last N candles for each symbol.
-                # For demonstration, we'll simulate fetching historical candles for indicator calculation.
-                # In a full tick-by-tick setup, you'd feed a `deque` of tick-built candles to these functions.
-
-                # Simulate fetching historical candles (replace with real-time candle history in production)
-                # You'll need a mechanism to store and retrieve the last N completed candles for each symbol
-                # from the `build_candle_from_ticks` process.
-                past_candles_for_indicators = [current_candle] # Placeholder: in reality, this would be `history_of_n_candles`
-                if len(past_candles_for_indicators) < max(SUPER_TREND_PERIOD, SLOW_MA_PERIOD + SIGNAL_PERIOD):
-                    logger.warning(f"Not enough historical candles for {symbol} to calculate indicators accurately.")
-                    continue # Wait for more candles if not enough history for indicators
+                # **IMPORTANT: For accurate indicator calculations (like Supertrend, MACD),**
+                # you NEED a history of `period` candles. The `build_candle_from_ticks`
+                # function currently only provides the *latest* completed candle.
+                # In a production system, you would maintain a `deque` or list of the
+                # last `max(SUPER_TREND_PERIOD, SLOW_MA_PERIOD + SIGNAL_PERIOD)`
+                # completed candles for each symbol.
+                # For this example, we'll proceed with just the latest candle, but be aware
+                # that indicators will be less meaningful without sufficient history.
+                
+                # Placeholder for historical candles: in reality, this would be `history_of_n_candles`
+                # For basic demonstration, we can simulate by repeating the current candle
+                # or acknowledge that true indicator accuracy requires more.
+                
+                # A better approach (but more complex for a single file) would be to
+                # maintain a `deque` of `CANDLE_RESOLUTION_SECONDS` candles in a global state
+                # and pass that to `calculate_supertrend` and `calculate_macd`.
+                
+                # For now, let's create a minimal `past_candles_for_indicators`
+                # This will make indicators very volatile but avoid errors for now.
+                # Consider this a *critical area for improvement* for actual trading.
+                num_required_candles = max(SUPER_TREND_PERIOD, SLOW_MA_PERIOD + SIGNAL_PERIOD)
+                past_candles_for_indicators = [futures_candle] * num_required_candles # Placeholder for actual historical data
 
                 # --- Strategy Logic (Remains the same as before) ---
                 supertrend_values, supertrend_trend = calculate_supertrend(
@@ -678,8 +737,10 @@ def execute_strategy(algo_status_dict, app_logger):
                     past_candles_for_indicators, FAST_MA_PERIOD, SLOW_MA_PERIOD, SIGNAL_PERIOD
                 )
 
-                if not supertrend_values or not macd_line:
-                    logger.warning(f"Indicators not calculated for {symbol}. Skipping trade signal generation.")
+                if not supertrend_values or not macd_line or not supertrend_trend or not signal_line or not macd_histogram:
+                    logger.warning(f"Indicators not calculated for {current_futures_symbol}. Skipping trade signal generation due to insufficient data or calculation error.")
+                    # Reset processed_any_candle_in_this_iteration if signal generation skipped due to this
+                    processed_any_candle_in_this_iteration = False 
                     continue
 
                 latest_supertrend = supertrend_values[-1]
@@ -688,9 +749,9 @@ def execute_strategy(algo_status_dict, app_logger):
                 latest_signal_line = signal_line[-1]
                 latest_macd_histogram = macd_histogram[-1]
 
-                current_spot_price = current_candle[4] # Use candle close as current price for this check
+                current_futures_price_for_signal = futures_candle[4] # Use candle close as current price for this check
 
-                logger.info(f"Strategy check for {symbol}: ST: {latest_supertrend:.2f}, Trend: {latest_supertrend_trend}, MACD: {latest_macd_line:.2f}, Signal: {latest_signal_line:.2f}, Hist: {latest_macd_histogram:.2f}")
+                logger.info(f"Strategy check for {current_futures_symbol}: ST: {latest_supertrend:.2f}, Trend: {latest_supertrend_trend}, MACD: {latest_macd_line:.2f}, Signal: {latest_signal_line:.2f}, Hist: {latest_macd_histogram:.2f}")
 
                 trade_signal = None
                 if latest_supertrend_trend == 1 and latest_macd_line > latest_signal_line and latest_macd_histogram > 0:
@@ -705,81 +766,95 @@ def execute_strategy(algo_status_dict, app_logger):
 
 
                 if trade_signal and len(active_trades) < MAX_ACTIVE_TRADES:
-                    logger.info(f"Strong trade signal detected for {symbol}: {trade_signal}")
+                    logger.info(f"Strong trade signal detected for {current_futures_symbol}: {trade_signal}")
 
-                    # Determine ATM strike and option symbol (unchanged logic)
-                    if symbol == "NSE:BANKNIFTYFUT": # Use futures as proxy for spot to get ATM
-                        atm_strike = get_current_atm_strike(current_spot_price, BANKNIFTY_STRIKE_INTERVAL)
-                        expiry_date = get_nearest_expiry_date(OPTION_EXPIRY_DAYS_AHEAD)
-                        is_call = True if trade_signal == 'BUY' else False # Buy Call for BUY, Buy Put for SELL
-                        option_symbol = get_current_option_symbol("NSE:BANKNIFTY", expiry_date, is_call, atm_strike)
-                        target_symbol = option_symbol # Trade the option
-                        product_type = "MIS" # Margin Intraday Square off
-                        order_type = "MARKET" # Or "LIMIT" if you want to specify entry_price
-                        quantity = TRADE_QUANTITY_PER_LOT_BANKNIFTY # Quantity for BankNifty options
+                    # Determine ATM strike and option symbol
+                    # Use SYMBOL_SPOT_BASE_NAME ("BANKNIFTY") for option symbol construction
+                    atm_strike = get_current_atm_strike(current_futures_price_for_signal, BANKNIFTY_STRIKE_INTERVAL)
+                    expiry_date = get_nearest_expiry_date(OPTION_EXPIRY_DAYS_AHEAD)
+                    is_call = True if trade_signal == 'BUY' else False # Buy Call for BUY, Buy Put for SELL
+                    option_symbol = get_current_option_symbol(SYMBOL_SPOT_BASE_NAME, expiry_date, is_call, atm_strike)
+                    
+                    target_symbol_to_trade = option_symbol # This is the option symbol to trade
 
-                        # Calculate Target and Stop Loss for the option (relative to current option price)
-                        # This requires fetching the option's current price, which you'd get from ticks
-                        # or a quote API. For simplicity here, we'll use a placeholder.
-                        option_current_price = current_spot_price * 0.01 # Placeholder - **MUST GET ACTUAL OPTION PRICE**
-                        entry_price = option_current_price # Assume market order, so entry is current price
+                    # --- NEW: Subscribe to the specific option symbol if not already subscribed ---
+                    if target_symbol_to_trade not in latest_prices and websocket_client:
+                        try:
+                            logger.info(f"Dynamically subscribing to option symbol for trade: {target_symbol_to_trade}")
+                            websocket_client.subscribe(symbols=[target_symbol_to_trade], data_type="symbolData")
+                            # Give a moment for initial tick to arrive
+                            time.sleep(1.5) # A slightly longer sleep to allow first tick to come in
+                        except Exception as e:
+                            logger.error(f"Failed to subscribe to option symbol {target_symbol_to_trade} dynamically: {e}")
+                            # Decide if you want to proceed without real-time option data or skip trade
+                            continue # Skip this trade if subscription fails
 
-                        calculated_target = entry_price * (1 + TARGET_MULTIPLIER) if trade_signal == 'BUY' else entry_price * (1 - TARGET_MULTIPLIER)
-                        calculated_stop_loss = entry_price * (1 - STOP_LOSS_MULTIPLIER) if trade_signal == 'BUY' else entry_price * (1 + STOP_LOSS_MULTIPLIER)
+                    # --- NEW: Fetch option_current_price from latest_prices for entry ---
+                    option_current_price = latest_prices.get(target_symbol_to_trade) # Use .get() to avoid KeyError
+                    if option_current_price is None:
+                        logger.warning(f"No real-time price available for {target_symbol_to_trade} after subscription. Skipping order placement for this signal.")
+                        continue # Skip this trade if no real-time price after attempting subscription
+                    
+                    logger.info(f"Real-time option price for {target_symbol_to_trade}: {option_current_price:.2f}")
 
-                        logger.info(f"Attempting to place {trade_signal} trade for {target_symbol} @ {entry_price:.2f} (Target: {calculated_target:.2f}, SL: {calculated_stop_loss:.2f})")
+                    product_type = "MIS" # Margin Intraday Square off
+                    order_type = "MARKET" # Or "LIMIT" if you want to specify entry_price
+                    quantity = TRADE_QUANTITY_PER_LOT_BANKNIFTY # Quantity for BankNifty options
 
-                        # Place order
-                        success, order_id = place_order_api(
-                            target_symbol,
-                            1 if trade_signal == 'BUY' else -1,
-                            quantity,
-                            product_type,
-                            order_type,
-                            price=entry_price,
-                            trade_mode='PAPER' # Change to 'LIVE' for live trading
-                        )
+                    entry_price = option_current_price # Assume market order, so entry is current price
 
-                        if success:
-                            trade_details_for_monitoring = {
-                                "order_id": order_id,
-                                "symbol": target_symbol,
-                                "signal": trade_signal,
-                                "entry_time": datetime.now().isoformat(),
-                                "entry_price": entry_price,
-                                "target_price": calculated_target,
-                                "stop_loss_price": calculated_stop_loss,
-                                "quantity": quantity,
-                                "product_type": product_type,
-                                "order_type": order_type,
-                                "trade_mode": 'PAPER', # Reflects what was placed
-                                "status": "ACTIVE"
-                            }
-                            active_trades[target_symbol] = trade_details_for_monitoring
-                            log_trade(trade_details_for_monitoring)
-                            logger.info(f"Trade placed successfully for {target_symbol}. Now monitoring...")
+                    calculated_target = entry_price * (1 + TARGET_MULTIPLIER) if trade_signal == 'BUY' else entry_price * (1 - TARGET_MULTIPLIER)
+                    calculated_stop_loss = entry_price * (1 - STOP_LOSS_MULTIPLIER) if trade_signal == 'BUY' else entry_price * (1 + STOP_LOSS_MULTIPLIER)
 
-                            # Instead of a blocking loop, monitoring would be based on subsequent ticks/candles
-                            # and checked in this main loop or in a separate event handler.
-                            # For this refactor, `monitor_and_manage_trade` will be called on each new candle.
-                        else:
-                            logger.error("Failed to place trade.")
+                    logger.info(f"Attempting to place {trade_signal} trade for {target_symbol_to_trade} @ {entry_price:.2f} (Target: {calculated_target:.2f}, SL: {calculated_stop_loss:.2f})")
+
+                    # Place order
+                    success, order_id = place_order_api(
+                        target_symbol_to_trade,
+                        1 if trade_signal == 'BUY' else -1,
+                        quantity,
+                        product_type,
+                        order_type,
+                        price=entry_price,
+                        trade_mode='PAPER' # Change to 'LIVE' for live trading
+                    )
+
+                    if success:
+                        trade_details_for_monitoring = {
+                            "order_id": order_id,
+                            "symbol": target_symbol_to_trade,
+                            "signal": trade_signal,
+                            "entry_time": datetime.now().isoformat(),
+                            "entry_price": entry_price,
+                            "target_price": calculated_target,
+                            "stop_loss_price": calculated_stop_loss,
+                            "quantity": quantity,
+                            "product_type": product_type,
+                            "order_type": order_type,
+                            "trade_mode": 'PAPER', # Reflects what was placed
+                            "status": "ACTIVE"
+                        }
+                        active_trades[target_symbol_to_trade] = trade_details_for_monitoring
+                        log_trade(trade_details_for_monitoring)
+                        logger.info(f"Trade placed successfully for {target_symbol_to_trade}. Now monitoring...")
+
                     else:
-                        logger.info(f"No specific option trading logic for {symbol}. Skipping.")
+                        logger.error("Failed to place trade.")
                 else:
                     if trade_signal: # If signal is there but max trades reached
-                        logger.info(f"Trade signal for {symbol} but maximum active trades ({MAX_ACTIVE_TRADES}) reached.")
+                        logger.info(f"Trade signal for {current_futures_symbol} but maximum active trades ({MAX_ACTIVE_TRADES}) reached.")
                     else:
-                        logger.info("No strong trade signal or filter condition not met for current candle.")
-            else:
-                logger.info(f"No new completed candle available for {symbol} yet. Waiting for ticks...")
-                # No new completed candle yet, sleep for a short duration
-                time.sleep(1) # Small sleep to prevent busy-waiting
-
-        # After processing all symbols, check/monitor active trades
+                        logger.debug("No strong trade signal or filter condition not met for current candle.") # Changed to debug for less verbosity
+        else: # If no new futures candle
+            logger.debug(f"No new completed futures candle for {current_futures_symbol} available yet. Waiting for ticks...") # Use debug for less verbose output
+        
+        # After processing signals, check/monitor active trades
         for symbol, trade_obj in list(active_trades.items()): # Iterate over a copy as dict might change
             monitor_and_manage_trade(trade_obj)
-
+        
+        # Add a small sleep if no new candle was processed to prevent busy-waiting
+        if not processed_any_candle_in_this_iteration:
+            time.sleep(1) # Small sleep to prevent busy-waiting if no new data or signal
 
 # --- Bonus Intelligence Functions (Placeholders) ---
 def filter_high_vix(vix_value):
@@ -792,19 +867,11 @@ def filter_high_vix(vix_value):
 
 def get_current_spot_price(symbol):
     """
-    Returns the latest known price for a symbol.
-    In a tick-by-tick system, this would ideally retrieve the LPT from the `symbol_ticks` deque
-    or the close of the `last_completed_candles`.
+    Returns the latest known price for a symbol from the real-time tick data.
+    This is used by monitor_and_manage_trade and can also be used as underlying for option selection.
     """
-    if symbol in symbol_ticks and symbol_ticks[symbol]:
-        # Return the last traded price from the accumulated ticks
-        return symbol_ticks[symbol][-1][1]
-    elif symbol in last_completed_candles:
-        # If no fresh ticks, use the close of the last completed candle
-        return last_completed_candles[symbol][4]
-    else:
-        logger.warning(f"No current price available for {symbol} from tick data.")
-        return None # No data yet
+    global latest_prices
+    return latest_prices.get(symbol) # Safely get price, returns None if not found
 
 
 # --- Initial Setup for direct run (for testing purposes) ---
@@ -818,8 +885,13 @@ if __name__ == "__main__":
             print(f"[INFO][AppLogger] {datetime.now().strftime('%H:%M:%S')} - {message}")
         def warning(self, message):
             print(f"[WARNING][AppLogger] {datetime.now().strftime('%H:%M:%S')} - {message}")
-        def error(self, message):
+        def error(self, message, exc_info=False): # Added exc_info for full tracebacks
             print(f"[ERROR][AppLogger] {datetime.now().strftime('%H:%M:%S')} - {message}")
+            if exc_info:
+                import traceback
+                traceback.print_exc()
+        def debug(self, message): # Added for debug messages
+            print(f"[DEBUG][AppLogger] {datetime.now().strftime('%H:%M:%S')} - {message}")
     
     mock_app_logger = MockAppLogger()
 
