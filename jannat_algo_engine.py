@@ -20,6 +20,9 @@ ACCESS_TOKEN_STORAGE_FILE = os.path.join(PERSISTENT_DISK_BASE_PATH, "fyers_acces
 CAPITAL_FILE = os.path.join(PERSISTENT_DISK_BASE_PATH, "jannat_capital.json")
 TRADE_LOG_FILE = os.path.join(PERSISTENT_DISK_BASE_PATH, "jannat_trade_log.json")
 
+# Define a separate directory for Fyers WebSocket logs
+FYERS_WS_LOG_DIR = os.path.join(PERSISTENT_DISK_BASE_PATH, "fyers_ws_logs")
+
 # Trading Parameters
 BASE_CAPITAL = 100000.0
 SYMBOL_SPOT = "NSE:BANKNIFTY"
@@ -431,13 +434,16 @@ def start_fyers_websocket(access_token, client_id, symbols):
     """Initializes and starts the Fyers WebSocket connection for data."""
     global logger # Ensure logger is accessible
     try:
+        # Ensure the log directory exists
+        os.makedirs(FYERS_WS_LOG_DIR, exist_ok=True)
+        logger.info(f"Fyers WebSocket log directory ensured: {FYERS_WS_LOG_DIR}")
+
         fyers_data_ws = data_ws.FyersDataSocket(
             access_token=access_token,
-            log_path=os.path.join(PERSISTENT_DISK_BASE_PATH, "fyers_ws_log.txt"), # Optional: specify log path
+            log_path=FYERS_WS_LOG_DIR, # Corrected: Pass the directory path
             litemode=False, # Set to True for light mode (fewer fields), False for full data
             write_to_file=False, # Set to True to write raw data to file
             reconnect=True, # Enable auto-reconnection
-            # Removed onmsg, onopen, onclose, onerror from constructor
         )
         # Assign callbacks after initialization
         fyers_data_ws.on_message = on_ticks_callback
