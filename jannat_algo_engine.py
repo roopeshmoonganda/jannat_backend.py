@@ -636,20 +636,18 @@ def execute_strategy(algo_status_dict, app_logger_instance):
     This is designed to run in a separate thread.
     """
     global logger, websocket_client
-    logger = app_logger_instance # Use the Flask app's logger
+    logger = app_logger_instance
 
     logger.info("Jannat Algo Engine started. Loading capital data...")
     load_capital_data()
     logger.info("Capital data loaded. Attempting Fyers API Setup for WebSocket...")
 
-    # --- Fyers API Setup for WebSocket ---
     access_token = get_fyers_access_token()
     if not access_token:
         logger.error("Cannot start algo: Fyers access token is missing or invalid. Stopping algo.")
         algo_status_dict["status"] = "stopped"
         return
 
-    # Initialize Fyers WebSocket connection
     websocket_client = start_fyers_websocket(access_token, logger)
     if not websocket_client:
         logger.error("Fyers WebSocket initialization failed. Stopping algo.")
@@ -657,6 +655,35 @@ def execute_strategy(algo_status_dict, app_logger_instance):
         return
     
     logger.info("Fyers WebSocket initialized and connected. Entering main algo loop...")
+
+    last_candle_processed_timestamp = {} 
+    
+    current_futures_symbol = get_current_month_futures_symbol()
+    
+    initialize_tick_data_buffers([current_futures_symbol])
+
+    while algo_status_dict["status"] == "running":
+        if not is_market_open():
+            logger.info("Market is closed. Waiting for market open.")
+            if websocket_client and websocket_client.is_connected:
+                logger.info("Market closed, closing Fyers WebSocket connection.")
+                # CORRECTED: Changed .disconnect() to .close_connection()
+                websocket_client.close_connection() 
+                websocket_client = None
+            time.sleep(60) 
+            continue
+        
+        if not websocket_client or not websocket_client.is_connected:
+            logger.info("Market is open, reconnecting Fyers WebSocket.")
+            websocket_client = start_fyers_websocket(access_token, logger)
+            if not websocket_client:
+                logger.error("Failed to reconnect WebSocket. Skipping this cycle.")
+                time.sleep(10)
+                continue
+
+        processed_any_candle_in_this_iteration = False
+        
+        futures_candle = last_completed_candles.get(current_futures_symbol)
 
     # --- Main Algo Loop - Now driven by new candle availability ---
     last_candle_processed_timestamp = {} # Track the timestamp of the last candle we processed for each symbol
