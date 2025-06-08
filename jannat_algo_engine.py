@@ -427,6 +427,38 @@ def build_candle_from_ticks(symbol):
     # Any remaining ticks in `ticks_for_symbol` are for the *next* candle interval.
     # These will be processed in subsequent calls to `build_candle_from_ticks`.
 
+def start_fyers_websocket(access_token, client_id, symbols):
+    """Initializes and starts the Fyers WebSocket connection for data."""
+    global logger # Ensure logger is accessible
+    try:
+        fyers_data_ws = data_ws.FyersDataSocket(
+            access_token=access_token,
+            log_path=os.path.join(PERSISTENT_DISK_BASE_PATH, "fyers_ws_log.txt"), # Optional: specify log path
+            litemode=False, # Set to True for light mode (fewer fields), False for full data
+            write_to_file=False, # Set to True to write raw data to file
+            reconnect=True, # Enable auto-reconnection
+            onmsg=on_ticks_callback, # Callback for incoming messages (ticks)
+            onopen=lambda: logger.info("Fyers data WebSocket connection opened."),
+            onclose=lambda: logger.info("Fyers data WebSocket connection closed."),
+            onerror=lambda e: logger.error(f"Fyers data WebSocket error: {e}")
+        )
+        fyers_data_ws.connect()
+
+        # Subscribe to symbols
+        # Fyers API requires symbols in a specific format for subscription, e.g., ["NSE:BANKNIFTY-I"]
+        # Ensure your `symbols` list matches this format.
+        # For data_ws, it's typically: {"symbols": ["NSE:SYMBOL-EQ", "NSE:NIFTY24SEPFUT"]}
+        subscribe_data = {
+            "symbols": symbols,
+            "dataType": "symbolData" # Or "candleData" if you want 1-min candles from Fyers itself
+        }
+        fyers_data_ws.subscribe(data=subscribe_data)
+        logger.info(f"Subscribed to Fyers WebSocket for symbols: {symbols}")
+        return fyers_data_ws
+    except Exception as e:
+        logger.error(f"Failed to start Fyers WebSocket: {e}")
+        return None
+
 
 # --- Trade Management Functions ---
 
@@ -574,6 +606,7 @@ def execute_strategy(algo_status_dict, app_logger):
         return
 
     # Assuming FYERS_CLIENT_ID is globally available from app.py config
+    # In app.py: FYERS_CLIENT_ID = f"{FYERS_APP_ID}-100"
     fyers_client_id = os.environ.get("FYERS_APP_ID", "dummy_app_id") + "-100"
 
     # The symbols we are interested in. This should dynamically include selected options.
