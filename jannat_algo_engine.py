@@ -102,12 +102,12 @@ def on_error(message):
     global logger
     logger.error(f"WebSocket Error: {message}")
 
-# CORRECTED: Changed signature to match FyersDataSocket's expected on_close arguments
+# CORRECTED: on_close now accepts ws, close_code, and close_reason
 def on_close(ws, close_code, close_reason): 
     global logger
     logger.info(f"WebSocket connection closed. Code: {close_code}, Reason: {close_reason}")
 
-# CORRECTED: Changed signature to match FyersDataSocket's expected on_connect arguments
+# CORRECTED: on_open now accepts ws
 def on_open(ws): 
     global logger
     logger.info("WebSocket connection opened.")
