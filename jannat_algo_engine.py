@@ -258,7 +258,7 @@ def connect_fyers_websocket():
             on_message=on_message,
             on_error=on_error,
             on_close=on_close,
-            on_open=on_open,
+            # Removed 'on_open' as per the TypeError traceback
             enable_websocket_log=True
         )
         logger.info("Attempting to connect Fyers WebSocket...")
