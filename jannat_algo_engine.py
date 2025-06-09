@@ -9,877 +9,645 @@ from collections import deque
 import threading
 import logging # Import logging module
 import sys # Import sys module for stdout
+import pytz # For timezone-aware market hours
 
 # --- Fyers API V3 Imports ---
 from fyers_apiv3 import fyersModel
 from fyers_apiv3.FyersWebsocket import data_ws
 
 # --- Configuration ---
-# Use environment variable for Flask backend URL, default to localhost for testing
-FLASK_BACKEND_URL = os.environ.get("FLASK_BACKEND_URL", "https://jannat-backend-py.onrender.com") 
+# Use environment variable for Flask backend URL, default for local testing
+FLASK_BACKEND_URL = os.environ.get("FLASK_BACKEND_URL", "https://jannat-backend-py.onrender.com")
+
+# This path must match the persistent disk mount path configured in Render
+# Set this as an environment variable in Render for your service, e.g., /var/data
+PERSISTENT_DISK_BASE_PATH = os.environ.get("PERSISTENT_DISK_PATH", "./jannat_data") # Default to local folder for testing
+
+# Fyers API credentials (pulled from environment variables)
+FYERS_APP_ID = os.environ.get("FYERS_APP_ID")
+FYERS_SECRET_ID = os.environ.get("FYERS_SECRET_ID")
+FYERS_REDIRECT_URI = os.environ.get("FYERS_REDIRECT_URI") # e.g., https://your-backend-service.onrender.com/fyers_auth_callback
 
 # File paths for persistent storage on Render's disk or local directory
-# This path needs to be correctly set up on your Render service as a persistent disk mount point.
-PERSISTENT_DISK_BASE_PATH = os.environ.get("PERSISTENT_DISK_PATH", ".") 
 ACCESS_TOKEN_STORAGE_FILE = os.path.join(PERSISTENT_DISK_BASE_PATH, "fyers_access_token.json")
 CAPITAL_FILE = os.path.join(PERSISTENT_DISK_BASE_PATH, "jannat_capital.json")
 TRADE_LOG_FILE = os.path.join(PERSISTENT_DISK_BASE_PATH, "jannat_trade_log.json")
+ALGO_LOG_FILE = os.path.join(PERSISTENT_DISK_BASE_PATH, "jannat_algo_engine.log")
 
 # Define a separate directory for Fyers WebSocket logs
 FYERS_WS_LOG_DIR = os.path.join(PERSISTENT_DISK_BASE_PATH, "fyers_ws_logs")
 
-# Trading Parameters
+# Trading Parameters (from your original snippet, maintain these)
 BASE_CAPITAL = 100000.0
-# Changed SYMBOL_SPOT_BASE_NAME to just the instrument name, not with "NSE:"
-# This allows dynamic generation of futures/options symbols easily
-SYMBOL_SPOT_BASE_NAME = "BANKNIFTY" 
-OPTION_EXPIRY_DAYS_AHEAD = 7 # Used in get_nearest_expiry_date (Placeholder, actual expiry logic needed)
-BANKNIFTY_STRIKE_INTERVAL = 100
-NIFTY_STRIKE_INTERVAL = 50 # Not used for BANKNIFTY, but good to have if you expand
+# Define the symbols your strategies will trade and monitor
+# Ensure these are valid Fyers symbols (e.g., "NSE:RELIANCE-EQ", "NSE:NIFTY50-INDEX")
+# This will be used for WebSocket subscription and strategy.
+SYMBOLS_TO_MONITOR = ["NSE:NIFTY50-INDEX", "NSE:BANKNIFTY-INDEX", "NSE:RELIANCE-EQ"]
+# You would define your actual trading symbols here, e.g.,
+# TRADING_SYMBOLS = ["NSE:RELIANCE-EQ", "NSE:INFY-EQ"]
 
-# Strategy Parameters (Supertrend and MACD)
-SUPER_TREND_PERIOD = 10
-SUPER_TREND_MULTIPLIER = 3
-FAST_MA_PERIOD = 12
-SLOW_MA_PERIOD = 26
-SIGNAL_PERIOD = 9
+WINDOW_SIZE = 100 # For storing historical data if needed for indicators
+EMA_FAST_PERIOD = 9
+EMA_SLOW_PERIOD = 26
+RSI_PERIOD = 14
+MACD_FAST_PERIOD = 12
+MACD_SLOW_PERIOD = 26
+MACD_SIGNAL_PERIOD = 9
+STOP_LOSS_PERCENT = 0.005  # 0.5%
+TARGET_PERCENT = 0.01      # 1%
 
-# Trade Management Parameters
-TARGET_MULTIPLIER = 0.005 # 0.5% target
-STOP_LOSS_MULTIPLIER = 0.002 # 0.2% stop loss
-TRADE_QUANTITY_PER_LOT_BANKNIFTY = 15 # Example: BankNifty lot size
-MAX_ACTIVE_TRADES = 1 # Max number of concurrent trades
-
-# --- Global Variables for Algo Engine State ---
-active_trades = {} # Stores details of current active trades (key: symbol, value: trade_object)
-# Initialize with default structure, actual values loaded/reset later
-jannat_capital = {"current_balance": BASE_CAPITAL, "pnl_today": 0.0, "last_day_reset": datetime.now().isoformat()}
-
-# --- Global for Tick Data and Candle Reconstruction ---
-# Dictionary to hold ticks for each symbol: {'NSE:BANKNIFTY24SEPFUT': deque([(timestamp, price), ...]), ...}
-symbol_ticks = {}
-# Dictionary to store last completed candles: {'NSE:BANKNIFTY24SEPFUT': [timestamp, open, high, low, close, volume], ...}
-last_completed_candles = {}
-CANDLE_RESOLUTION_SECONDS = 300 # 5 minutes for example (5 * 60)
-
-# Global dictionary to store latest prices for subscribed symbols
-latest_prices = {}
-websocket_client = None # To store the Fyers WebSocket client instance
-
-# --- Configure Logging ---
-# Get the logger for this module
+# --- Configure Logging for Algo Engine ---
+# This setup sends logs to both stdout (for Render's console) and a persistent file.
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG) # Set to DEBUG to capture all messages
 
+# Clear existing handlers to prevent duplicate output if this block runs multiple times (e.g., in development)
+if logger.handlers:
+    for handler in logger.handlers:
+        logger.removeHandler(handler)
+        handler.close() # Important: close file handlers to release file locks
+
 # Create a StreamHandler to output logs to stdout
-if not logger.handlers: # Prevent adding multiple handlers if run multiple times
-    handler = logging.StreamHandler(sys.stdout)
-    formatter = logging.Formatter('[%(asctime)s] %(levelname)s in %(name)s: %(message)s')
-    handler.setFormatter(formatter)
-    logger.addHandler(handler)
+stream_handler = logging.StreamHandler(sys.stdout)
+stream_handler.setFormatter(logging.Formatter('[%(asctime)s] %(levelname)s in %(name)s: %(message)s'))
+logger.addHandler(stream_handler)
+
+# Create a FileHandler to output logs to a persistent file
+try:
+    os.makedirs(os.path.dirname(ALGO_LOG_FILE), exist_ok=True)
+    file_handler = logging.FileHandler(ALGO_LOG_FILE)
+    file_handler.setFormatter(logging.Formatter('[%(asctime)s] %(levelname)s in %(name)s: %(message)s'))
+    logger.addHandler(file_handler)
+    logger.info(f"Algo Engine logging to persistent file: {ALGO_LOG_FILE}")
+except Exception as e:
+    logger.error(f"Failed to set up file logger in jannat_algo_engine: {e}", exc_info=True)
 
 
-# --- Fyers WebSocket Data Handlers ---
-# MODIFIED: Using *args, **kwargs to accept any number of arguments for robust logging
-def on_message(*args, **kwargs):
-    """
-    Callback function to process incoming messages from Fyers WebSocket.
-    Processes both tick data and general messages.
-    """
-    global latest_prices, logger
-    logger.debug(f"on_message args: {args}, kwargs: {kwargs}") # Log arguments for inspection
-    
-    # Assuming the first argument is the message dictionary if only one is passed
-    message = args[0] if args else {} 
+# --- Global Variables for Algo State and Data ---
+current_capital_data = {"current_balance": 0.0, "pnl_today": 0.0} # Managed by algo, exposed to frontend
+active_trades = [] # List of dictionaries for currently active (open) trades
+fyers = None # Fyers API client instance for REST calls (e.g., placing orders)
+websocket_client = None # Fyers WebSocket client instance for real-time data
+latest_prices = {} # Dictionary to store latest prices from WebSocket: {'symbol': {'ltp': price, 'timestamp': time_str}}
 
-    if 'symbol' in message and 'ltp' in message:
-        latest_prices[message['symbol']] = message['ltp']
-        logger.debug(f"Received tick for {message['symbol']}: LTP = {message['ltp']}")
-        on_ticks_callback(websocket_client, [message])
-    elif 's' in message and message['s'] == 'ok' and 'msg' in message:
-        logger.info(f"WebSocket Message: {message['msg']}")
-    else:
-        logger.debug(f"Received non-tick WebSocket message: {message}")
+# Data structures for your strategy (from your snippet)
+historical_data = {symbol: deque(maxlen=WINDOW_SIZE) for symbol in SYMBOLS_TO_MONITOR}
+trade_signals_queue = deque(maxlen=100) # Assuming this is used for signals
 
-# MODIFIED: Using *args, **kwargs to accept any number of arguments for robust logging
-def on_error(*args, **kwargs):
-    global logger
-    logger.error(f"WebSocket Error: {args}, kwargs: {kwargs}") # Log arguments for inspection
-    # Assuming the message is the first argument
-    message = args[0] if args else "Unknown error"
-    logger.error(f"WebSocket Error: {message}")
 
-# MODIFIED: Using *args, **kwargs to accept any number of arguments for robust logging
-def on_close(*args, **kwargs): 
-    global logger
-    logger.info(f"WebSocket connection closed. args: {args}, kwargs: {kwargs}") # Log arguments for inspection
-    # Attempt to extract known arguments for logging if they exist
-    close_code = args[1] if len(args) > 1 else 'N/A'
-    close_reason = args[2] if len(args) > 2 else 'N/A'
-    logger.info(f"WebSocket connection closed. Code: {close_code}, Reason: {close_reason}")
-
-# MODIFIED: Using *args, **kwargs to accept any number of arguments for robust logging
-def on_open(*args, **kwargs): 
-    global logger
-    logger.info(f"WebSocket connection opened. args: {args}, kwargs: {kwargs}") # Log arguments for inspection
-    logger.info("WebSocket connection opened.")
-
-# --- Helper Functions ---
-
-def get_fyers_access_token():
-    """Reads the Fyers access token from a file."""
-    if not os.path.exists(ACCESS_TOKEN_STORAGE_FILE):
-        logger.error(f"Access token file not found at {ACCESS_TOKEN_STORAGE_FILE}. Please authenticate via the Flask backend.")
-        return None
-    try:
-        with open(ACCESS_TOKEN_STORAGE_FILE, 'r') as f:
-            token_data = json.load(f)
-            return token_data.get('access_token')
-    except json.JSONDecodeError:
-        logger.error("Error decoding access token JSON. File might be corrupted.")
-        return None
-    except Exception as e:
-        logger.error(f"Error reading access token: {e}", exc_info=True)
-        return None
-
-def save_capital_data():
-    """Saves the current capital data to a persistent file."""
-    try:
-        # Ensure the directory exists before saving
-        os.makedirs(os.path.dirname(CAPITAL_FILE), exist_ok=True)
-        with open(CAPITAL_FILE, 'w') as f:
-            json.dump(jannat_capital, f, indent=4)
-        logger.info("Capital data saved.")
-    except Exception as e:
-        logger.error(f"Error saving capital data: {e}", exc_info=True)
+# --- Helper Functions for Persistence ---
 
 def load_capital_data():
-    """Loads capital data from a persistent file, or initializes if not found."""
-    global jannat_capital
-    
-    # Define a default structure for jannat_capital to ensure all keys are present
-    default_capital_data = {
-        "current_balance": BASE_CAPITAL,
-        "pnl_today": 0.0,
-        "last_day_reset": datetime.now().isoformat()
-    }
-
+    """Loads capital data from a JSON file, creating if not exists."""
+    os.makedirs(os.path.dirname(CAPITAL_FILE), exist_ok=True) # Ensure directory exists
     if os.path.exists(CAPITAL_FILE):
         try:
             with open(CAPITAL_FILE, 'r') as f:
-                loaded_data = json.load(f)
-            
-            # Merge loaded data with defaults to ensure all keys are present
-            jannat_capital = {**default_capital_data, **loaded_data}
-            
-            # Check for new day reset
-            last_reset_date = datetime.fromisoformat(jannat_capital.get("last_day_reset", datetime.min.isoformat())).date()
-            if last_reset_date < datetime.now().date():
-                logger.info(f"New day detected. Resetting PnL from {jannat_capital.get('pnl_today', 0.0):.2f} to 0.")
-                jannat_capital["pnl_today"] = 0.0
-                jannat_capital["last_day_reset"] = datetime.now().isoformat()
-                save_capital_data() # Save the reset PnL
-            logger.info(f"Capital data loaded: {jannat_capital}")
-        except (json.JSONDecodeError, FileNotFoundError) as e:
-            logger.warning(f"Error loading capital data ({e}). Initializing with base capital.", exc_info=True)
-            jannat_capital = default_capital_data # Use default data for initialization
-            save_capital_data()
-    else:
-        logger.info("No existing capital data found. Initializing with base capital.")
-        jannat_capital = default_capital_data # Use default data for initialization
-        save_capital_data()
+                content = f.read()
+                if content:
+                    return json.loads(content)
+        except json.JSONDecodeError:
+            logger.error(f"Capital data file {CAPITAL_FILE} is corrupted. Initializing with BASE_CAPITAL.", exc_info=True)
+        except Exception as e:
+            logger.error(f"Error loading capital data: {e}", exc_info=True)
+    logger.info("Capital data file not found or corrupted. Initializing with BASE_CAPITAL.")
+    return {"current_balance": BASE_CAPITAL, "pnl_today": 0.0}
 
-def log_trade(trade_details):
-    """Logs trade details to a JSON file."""
-    # Ensure the directory exists before saving
-    os.makedirs(os.path.dirname(TRADE_LOG_FILE), exist_ok=True)
+def save_capital_data(data):
+    """Saves current capital data to a JSON file."""
+    os.makedirs(os.path.dirname(CAPITAL_FILE), exist_ok=True) # Ensure directory exists
+    try:
+        with open(CAPITAL_FILE, 'w') as f:
+            json.dump(data, f, indent=4)
+        logger.debug("Capital data saved successfully.")
+    except Exception as e:
+        logger.error(f"Error saving capital data: {e}", exc_info=True)
+
+def log_trade(trade_data):
+    """Appends a closed trade's data to a JSON log file for historical trades."""
+    os.makedirs(os.path.dirname(TRADE_LOG_FILE), exist_ok=True) # Ensure directory exists
     
-    trade_log = []
+    trades = []
     if os.path.exists(TRADE_LOG_FILE):
         try:
             with open(TRADE_LOG_FILE, 'r') as f:
                 content = f.read()
-                if content: # Check if file is not empty
-                    trade_log = json.loads(content)
+                if content:
+                    trades = json.loads(content)
         except json.JSONDecodeError:
-            logger.warning(f"Trade log file {TRADE_LOG_FILE} is corrupted. Starting new log.")
-            trade_log = [] # Reset if corrupted
+            logger.error(f"Trade log file {TRADE_LOG_FILE} is corrupted. Starting new log.", exc_info=True)
+            trades = []
         except Exception as e:
-            logger.error(f"Error reading trade log: {e}", exc_info=True)
-            trade_log = [] # Reset on other errors
+            logger.error(f"Error reading trade log file: {e}", exc_info=True)
+
+    trades.append(trade_data)
 
     try:
-        trade_log.append(trade_details)
         with open(TRADE_LOG_FILE, 'w') as f:
-            json.dump(trade_log, f, indent=4)
-        logger.info(f"Trade logged: {trade_details}")
+            json.dump(trades, f, indent=4)
+        logger.info(f"Trade logged: {trade_data.get('symbol')} {trade_data.get('signal')} @ {trade_data.get('entry_price')} PnL: {trade_data.get('pnl'):.2f}")
     except Exception as e:
         logger.error(f"Error writing trade log: {e}", exc_info=True)
 
-def is_market_open():
-    """Checks if the market is open for trading (e.g., NSE equity market hours)."""
-    now = datetime.now()
-    # IST Market Hours: 9:15 AM to 3:30 PM
-    market_open_time = now.replace(hour=9, minute=15, second=0, microsecond=0)
-    market_close_time = now.replace(hour=15, minute=30, second=0, microsecond=0)
 
-    # Check if it's a weekday (Monday=0 to Friday=4)
-    if now.weekday() < 5 and market_open_time <= now <= market_close_time:
-        return True
-    return False
+# --- Fyers API & WebSocket Integration ---
 
-def get_current_month_futures_symbol():
-    """
-    Generates the current month's BankNifty futures symbol in the format:
-    NSE:BANKNIFTYYYMONFUT (e.g., NSE:BANKNIFTY25JUNFUT)
-    """
-    now = datetime.now()
-    year_short = now.strftime('%y') # Last two digits of the year (e.g., 25)
-    month_abbr = now.strftime('%b').upper() # Three-letter month abbreviation (e.g., JUN, JUL)
-    return f"NSE:{SYMBOL_SPOT_BASE_NAME}{year_short}{month_abbr}FUT"
-
-def get_current_option_symbol(base_symbol_name, expiry_date, is_call, strike_price):
-    """Constructs the Fyers option symbol."""
-    # Example: NSE:BANKNIFTY24SEP46000CE
-    # Format: EXCHANGE:INSTRUMENT + YY + MON (3 chars) + Strike + PE/CE
-    
-    year_short = expiry_date.strftime('%y')
-    month_short = expiry_date.strftime('%b').upper() # e.g., JAN, FEB
-    option_type = "CE" if is_call else "PE"
-    strike_str = str(int(strike_price))
-
-    return f"NSE:{base_symbol_name}{year_short}{month_short}{strike_str}{option_type}"
-
-
-def get_current_atm_strike(current_spot_price, strike_interval):
-    """Calculates the At-The-Money (ATM) strike price."""
-    return round(current_spot_price / strike_interval) * strike_interval
-
-def get_nearest_expiry_date(option_expiry_days_ahead):
-    """Finds the nearest weekly or monthly expiry date for options."""
-    # NOTE: This is a simplified logic. For accurate expiry,
-    # you'd ideally fetch a list of valid expiry dates from Fyers API or master data.
-    today = datetime.now().date()
-    
-    # Try to find next Thursday (weekly expiry for BankNifty/Nifty)
-    days_until_thursday = (3 - today.weekday() + 7) % 7 # 3 is Thursday (Mon=0 to Sun=6)
-    next_thursday = today + timedelta(days=days_until_thursday)
-
-    # If the calculated next_thursday is today and it's past market close,
-    # or if today is Thursday and it's already a holiday/passed expiry,
-    # then it should roll to the next Thursday.
-    # This simplified logic might not cover all edge cases like holidays or monthly expiries.
-    # For a robust system, you'd query Fyers for actual expiry dates.
-    return next_thursday
-
-
-# --- Indicator Calculations ---
-
-def calculate_supertrend(candles, period, multiplier):
-    """Calculates Supertrend indicator."""
-    if len(candles) < period:
-        return [], [] # Return empty lists if not enough data
-
-    highs = np.array([c[2] for c in candles]) # [timestamp, open, high, low, close, volume]
-    lows = np.array([c[3] for c in candles])
-    closes = np.array([c[4] for c in candles])
-
-    # Calculate Average True Range (ATR)
-    tr = np.zeros(len(closes))
-    if len(closes) > 0:
-        tr[0] = highs[0] - lows[0]
-    for i in range(1, len(closes)):
-        tr[i] = max(highs[i] - lows[i], abs(highs[i] - closes[i-1]), abs(lows[i] - closes[i-1]))
-    
-    atr = np.array([np.mean(tr[max(0, i - period + 1):i+1]) for i in range(len(tr))])
-
-    # Calculate Basic Upper Band and Lower Band
-    basic_upper_band = (highs + lows) / 2 + multiplier * atr
-    basic_lower_band = (highs + lows) / 2 - multiplier * atr
-
-    # Calculate Final Upper Band and Lower Band
-    final_upper_band = np.copy(basic_upper_band)
-    final_lower_band = np.copy(basic_lower_band)
-
-    for i in range(1, len(closes)):
-        if closes[i-1] > final_upper_band[i-1]:
-            final_upper_band[i] = max(basic_upper_band[i], final_upper_band[i-1])
-        else:
-            final_upper_band[i] = basic_upper_band[i]
-
-        if closes[i-1] < final_lower_band[i-1]:
-            final_lower_band[i] = min(basic_lower_band[i], final_lower_band[i-1])
-        else:
-            final_lower_band[i] = basic_lower_band[i]
-
-    # Calculate Supertrend
-    supertrend = np.zeros(len(closes))
-    trend = np.zeros(len(closes)) # 1 for uptrend, -1 for downtrend
-
-    for i in range(len(closes)):
-        if i == 0:
-            if closes[i] > ((highs[i] + lows[i]) / 2):
-                trend[i] = 1
-            else:
-                trend[i] = -1
-            supertrend[i] = basic_lower_band[i] if trend[i] == 1 else basic_upper_band[i]
-        else:
-            if closes[i] > supertrend[i-1] and trend[i-1] == 1:
-                trend[i] = 1
-                supertrend[i] = max(final_lower_band[i], supertrend[i-1])
-            elif closes[i] < supertrend[i-1] and trend[i-1] == -1:
-                trend[i] = -1
-                supertrend[i] = min(final_upper_band[i], final_upper_band[i-1]) # Corrected here: min with current and previous upper band
-            elif closes[i] > supertrend[i-1] and trend[i-1] == -1:
-                trend[i] = 1
-                supertrend[i] = final_lower_band[i]
-            elif closes[i] < supertrend[i-1] and trend[i-1] == 1:
-                trend[i] = -1
-                supertrend[i] = final_upper_band[i]
-            else:
-                trend[i] = trend[i-1]
-                supertrend[i] = supertrend[i-1]
-
-
-    return supertrend.tolist(), trend.tolist()
-
-def calculate_macd(candles, fast_period, slow_period, signal_period):
-    """Calculates MACD indicator."""
-    min_required_candles = max(fast_period, slow_period) + signal_period - 1 
-    if len(candles) < min_required_candles:
-        return [], [], []
-
-    closes = np.array([c[4] for c in candles])
-
-    ema_fast = _calculate_ema(closes, fast_period)
-    ema_slow = _calculate_ema(closes, slow_period)
-
-    # MACD Line
-    if len(ema_fast) > len(ema_slow):
-        macd_line = ema_fast[-len(ema_slow):] - ema_slow
-    elif len(ema_slow) > len(ema_fast):
-        macd_line = ema_fast - ema_slow[-len(ema_fast):]
-    else:
-        macd_line = ema_fast - ema_slow
-
-    if len(macd_line) < signal_period:
-        return macd_line.tolist(), [], []
-
-    signal_line = _calculate_ema(macd_line, signal_period)
-    
-    # Histogram
-    histogram = macd_line[-len(signal_line):] - signal_line
-
-    return macd_line.tolist(), signal_line.tolist(), histogram.tolist()
-
-def _calculate_ema(data, period):
-    """Helper to calculate Exponential Moving Average (EMA)."""
-    if len(data) < period:
-        return np.array([])
-    
-    ema_values = np.zeros_like(data, dtype=float)
-    
-    # Simple Moving Average for the first 'period' values for initial EMA
-    ema_values[period - 1] = np.mean(data[:period])
-    multiplier = 2 / (period + 1)
-    
-    for i in range(period, len(data)):
-        ema_values[i] = ((data[i] - ema_values[i-1]) * multiplier) + ema_values[i-1]
-
-    return ema_values[period-1:]
-
-
-# --- Tick Data Processing and Candle Reconstruction ---
-
-def initialize_tick_data_buffers(symbols):
-    """Initializes deque for each symbol to store incoming ticks."""
-    for symbol in symbols:
-        symbol_ticks[symbol] = deque() # Stores (timestamp, price) tuples
-
-def on_ticks_callback(ws_client, ticks):
-    """
-    Callback function to process incoming ticks from Fyers WebSocket.
-    """
-    global symbol_ticks, last_completed_candles, logger
-
-    # Ensure ticks is always a list of dictionaries, even if it's a single dict
-    if isinstance(ticks, dict):
-        ticks = [ticks]
-
-    for tick in ticks:
-        symbol = tick.get('symbol')
-        timestamp_seconds = tick.get('timestamp') 
-        ltp = tick.get('ltp')
-
-        if symbol and timestamp_seconds and ltp is not None:
-            tick_time = datetime.fromtimestamp(timestamp_seconds)
-            
-            if symbol not in symbol_ticks:
-                symbol_ticks[symbol] = deque()
-            
-            symbol_ticks[symbol].append((tick_time, ltp))
-
-            # Attempt to build a candle from the accumulated ticks
-            build_candle_from_ticks(symbol)
-
-
-def build_candle_from_ticks(symbol):
-    """
-    Reconstructs candles from accumulated ticks for a given symbol.
-    """
-    global symbol_ticks, last_completed_candles, logger, CANDLE_RESOLUTION_SECONDS
-
-    if symbol not in symbol_ticks or not symbol_ticks[symbol]:
-        return
-
-    current_time = datetime.now()
-    ticks_for_symbol = symbol_ticks[symbol]
-
-    market_open_hour = 9
-    market_open_minute = 15
-    
-    market_open_today = current_time.replace(hour=market_open_hour, minute=market_open_minute, second=0, microsecond=0)
-    
-    if current_time < market_open_today:
-        return # Market not yet open
-
-    elapsed_seconds = (current_time - market_open_today).total_seconds()
-    
-    # Calculate the current candle's start time and its corresponding end time
-    current_candle_start_seconds_offset = math.floor(elapsed_seconds / CANDLE_RESOLUTION_SECONDS) * CANDLE_RESOLUTION_SECONDS
-    current_candle_start_time = market_open_today + timedelta(seconds=current_candle_start_seconds_offset)
-    # current_candle_end_time = current_candle_start_time + timedelta(seconds=CANDLE_RESOLUTION_SECONDS) # Not directly used for tick processing logic below
-
-
-    # Process ticks that are *older* than the start of the *current* candle interval.
-    # These ticks belong to a *completed* candle.
-    ticks_for_completed_candle = deque()
-    while ticks_for_symbol and ticks_for_symbol[0][0] < current_candle_start_time:
-        ticks_for_completed_candle.append(ticks_for_symbol.popleft())
-
-    # If we have collected ticks for a completed candle:
-    if ticks_for_completed_candle:
-        # The start time of this completed candle would be `current_candle_start_time - timedelta(seconds=CANDLE_RESOLUTION_SECONDS)`
-        completed_candle_start_time = current_candle_start_time - timedelta(seconds=CANDLE_RESOLUTION_SECONDS)
-        
-        # Check if this completed candle has already been processed based on its start time
-        # This prevents duplicate candle processing if the tick stream lags or repeats
-        if symbol in last_completed_candles and last_completed_candles[symbol][0] == int(completed_candle_start_time.timestamp()):
-            # logger.debug(f"Candle for {symbol} starting {completed_candle_start_time} already processed. Skipping.")
-            return
-
-        sorted_ticks = sorted(list(ticks_for_completed_candle), key=lambda x: x[0])
-
-        if sorted_ticks:
-            open_price = sorted_ticks[0][1]
-            close_price = sorted_ticks[-1][1]
-            high_price = max(t[1] for t in sorted_ticks)
-            low_price = min(t[1] for t in sorted_ticks)
-            volume = len(sorted_ticks) # Simple tick count as volume for now
-
-            new_candle = [int(completed_candle_start_time.timestamp()), open_price, high_price, low_price, close_price, volume]
-            
-            # Store this as the last completed candle for the symbol
-            last_completed_candles[symbol] = new_candle
-            logger.info(f"New {CANDLE_RESOLUTION_SECONDS/60}-min candle for {symbol} completed: {datetime.fromtimestamp(new_candle[0])} - O:{new_candle[1]}, H:{new_candle[2]}, L:{new_candle[3]}, C:{new_candle[4]}, V:{new_candle[5]}")
-            # The strategy logic will pick this up in the main loop.
-
-
-def start_fyers_websocket(access_token):
-    """Initializes and starts the Fyers WebSocket connection for data."""
-    global websocket_client, logger
-    # logger is already configured globally, no need to reassign app_logger_instance
-
-    logger.info("Attempting to start Fyers WebSocket...")
+def load_access_token():
+    """Loads the Fyers access token from the persistent storage file."""
+    if not os.path.exists(ACCESS_TOKEN_STORAGE_FILE):
+        logger.error(f"Access token file not found at {ACCESS_TOKEN_STORAGE_FILE}. "
+                     "Please ensure Fyers authentication has completed successfully via the backend /login endpoint.")
+        return None
     try:
-        os.makedirs(FYERS_WS_LOG_DIR, exist_ok=True)
-        logger.info(f"Fyers WebSocket log directory ensured: {FYERS_WS_LOG_DIR}")
-
-        websocket_client = data_ws.FyersDataSocket(
-            access_token=access_token,
-            log_path=FYERS_WS_LOG_DIR, 
-            litemode=False,
-            write_to_file=False,
-            reconnect=True,
-            on_message=on_message,    
-            on_error=on_error,       
-            on_close=on_close,       
-            on_connect=on_open,      
-        )
-
-        logger.info("Connecting to Fyers WebSocket...")
-        websocket_client.connect()
-        logger.info("Fyers WebSocket connection initiated.")
-
-        current_futures_symbol = get_current_month_futures_symbol()
-        initial_symbols_to_watch = [current_futures_symbol]
-
-        websocket_client.subscribe(symbols=initial_symbols_to_watch, data_type="symbolData") 
-        logger.info(f"Subscribed to Fyers WebSocket for initial symbols: {initial_symbols_to_watch}")
-        return websocket_client
+        with open(ACCESS_TOKEN_STORAGE_FILE, 'r') as f:
+            token_data = json.load(f)
+            return token_data.get("access_token")
+    except json.JSONDecodeError:
+        logger.error(f"Error decoding access token JSON from {ACCESS_TOKEN_STORAGE_FILE}. File might be corrupted.", exc_info=True)
+        return None
     except Exception as e:
-        logger.error(f"Failed to start Fyers WebSocket: {e}", exc_info=True)
+        logger.error(f"Error loading access token: {e}", exc_info=True)
         return None
 
-
-# --- Trade Management Functions ---
-
-def place_order_api(symbol, side, quantity, product_type, order_type, price=0, trade_mode='LIVE'):
-    """Sends a trade request to the Flask backend's /trade/execute endpoint."""
-    url = f"{FLASK_BACKEND_URL}/trade/execute"
-    payload = {
-        "symbol": symbol,
-        "signal": "BUY" if side == 1 else "SELL", # Convert side (1/-1) to string (BUY/SELL)
-        "quantity": quantity,
-        "product_type": product_type,
-        "order_type": order_type,
-        "entryPrice": price, 
-        "trade_mode": trade_mode
-    }
-    logger.info(f"Sending order placement request to backend for {symbol} ({'BUY' if side == 1 else 'SELL'})...")
-    try:
-        response = requests.post(url, json=payload)
-        response.raise_for_status() # Raise HTTPError for bad responses (4xx or 5xx)
-        result = response.json()
-        if result.get("success"):
-            logger.info(f"Order placed successfully for {symbol}. Order ID: {result.get('orderId')}")
-            return True, result.get('orderId')
-        else:
-            logger.error(f"Failed to place order for {symbol}: {result.get('message')}")
-            return False, result.get('message')
-    except requests.exceptions.RequestException as e:
-        logger.error(f"API request error while placing order for {symbol}: {e}", exc_info=True)
-        return False, str(e)
-
-
-def monitor_and_manage_trade(trade_obj):
-    """
-    Monitors an active trade for stop-loss, target, or end-of-day exit.
-    """
-    global active_trades, jannat_capital, logger, latest_prices
-
-    symbol = trade_obj['symbol']
-    entry_price = trade_obj['entry_price']
-    signal = trade_obj['signal']
-    quantity = trade_obj['quantity']
-    target_price = trade_obj['target_price']
-    stop_loss_price = trade_obj['stop_loss_price']
-
-    # Use the latest price from the global latest_prices dictionary
-    current_price = latest_prices.get(symbol) # Get the real-time price of the traded option/future
-
-    if current_price is None:
-        logger.warning(f"Could not get current price for {symbol} from latest_prices for trade monitoring. Skipping this check.")
-        return # Skip monitoring if no price available yet
-
-    pnl = 0.0
-    exit_reason = None
-    exit_price = None
-
-    if signal == 'BUY':
-        if current_price >= target_price:
-            pnl = (target_price - entry_price) * quantity
-            exit_price = target_price
-            exit_reason = "Target Hit"
-        elif current_price <= stop_loss_price:
-            pnl = (stop_loss_price - entry_price) * quantity
-            exit_price = stop_loss_price
-            exit_reason = "Stop Loss Hit"
-    elif signal == 'SELL':
-        if current_price <= target_price: # For SELL, target is lower than entry
-            pnl = (entry_price - target_price) * quantity
-            exit_price = target_price
-            exit_reason = "Target Hit"
-        elif current_price >= stop_loss_price: # For SELL, SL is higher than entry
-            pnl = (entry_price - stop_loss_price) * quantity
-            exit_price = stop_loss_price
-            exit_reason = "Stop Loss Hit"
-
-    # End of day square off (Example: square off at 3:25 PM IST)
-    now = datetime.now()
-    square_off_time = now.replace(hour=15, minute=25, second=0, microsecond=0)
-    if now.weekday() < 5 and now >= square_off_time and exit_reason is None:
-        pnl = (current_price - entry_price) * quantity if signal == 'BUY' else (entry_price - current_price) * quantity
-        exit_price = current_price
-        exit_reason = "End of Day Square Off"
-        logger.info(f"Squaring off {symbol} trade due to end of day. Current PnL: {pnl:.2f}")
-
-
-    if exit_reason:
-        logger.info(f"Trade for {symbol} exited. Reason: {exit_reason}, PnL: {pnl:.2f}")
-        jannat_capital['current_balance'] += pnl
-        jannat_capital['pnl_today'] += pnl
-        save_capital_data()
-
-        trade_obj['exit_time'] = datetime.now().isoformat()
-        trade_obj['exit_price'] = exit_price
-        trade_obj['pnl'] = pnl
-        trade_obj['status'] = "CLOSED"
-        trade_obj['exit_reason'] = exit_reason
-        log_trade(trade_obj) # Log the closed trade
-
-        if symbol in active_trades:
-            del active_trades[symbol] # Remove from active trades
-
-        # Place exit order (if LIVE trade_mode)
-        if trade_obj.get('trade_mode') == 'LIVE': # Only place live exit order if original trade was LIVE
-            exit_side = -1 if signal == 'BUY' else 1 # Opposite side for exit (SELL if BUY, BUY if SELL)
-            logger.info(f"Placing exit order for {symbol} at {exit_price}")
-            success, message = place_order_api(symbol, exit_side, quantity, trade_obj['product_type'], 'MARKET', trade_mode='LIVE')
-            if not success:
-                logger.error(f"Failed to place exit order for {symbol}: {message}")
-
-
-# --- Centralized Functions for Frontend Polling ---
-def get_trade_details():
-    """Provides current trade details for frontend."""
-    return [trade for trade in active_trades.values()] # Return list of active trade objects
-
-def get_capital_data():
-    """Provides current capital data for frontend."""
-    return jannat_capital
-
-
-# --- Main Algo Engine Logic ---
-
-def execute_strategy(algo_status_dict, app_logger_instance_UNUSED):
-    """
-    Main function to run the algorithmic trading strategy.
-    This is designed to run in a separate thread.
-    The app_logger_instance_UNUSED argument is kept for compatibility with app.py
-    but is not used as 'logger' is now globally configured.
-    """
-    global logger, websocket_client
-    # logger is already configured globally via logging.getLogger(__name__)
-
-    logger.info("Jannat Algo Engine started. Loading capital data...")
-    load_capital_data()
-    logger.info("Capital data loaded. Attempting Fyers API Setup for WebSocket...")
-
-    # --- Fyers API Setup for WebSocket ---
-    access_token = get_fyers_access_token()
+def init_fyers_client():
+    """Initializes and returns the FyersModel client for REST API calls."""
+    global fyers
+    access_token = load_access_token()
     if not access_token:
-        logger.error("Cannot start algo: Fyers access token is missing or invalid. Stopping algo.")
-        algo_status_dict["status"] = "stopped"
-        return
-
-    # Initialize Fyers WebSocket connection
-    websocket_client = start_fyers_websocket(access_token) # No need to pass logger here
-    if not websocket_client:
-        logger.error("Fyers WebSocket initialization failed. Stopping algo.")
-        algo_status_dict["status"] = "stopped"
-        return
+        logger.error("Fyers access token not available. Cannot initialize REST client.")
+        fyers = None
+        return None
     
-    logger.info("Fyers WebSocket initialized and connected. Entering main algo loop...")
+    if not all([FYERS_APP_ID, FYERS_SECRET_ID]): # Redirect URI not strictly needed for client init
+        logger.error("Missing Fyers API credentials (APP_ID or SECRET_ID). Cannot initialize REST client.")
+        fyers = None
+        return None
 
-    # --- Main Algo Loop - Now driven by new candle availability ---
-    last_candle_processed_timestamp = {} # Track the timestamp of the last candle we processed for each symbol
+    try:
+        fyers = fyersModel.FyersModel(token=access_token, is_async=False, client_id=FYERS_APP_ID)
+        # You can add a small test call here to verify the token, e.g., get_profile()
+        logger.info("Fyers REST client initialization attempt complete.")
+        return fyers
+    except Exception as e:
+        logger.error(f"Error initializing Fyers REST client: {e}", exc_info=True)
+        fyers = None
+        return None
+
+def connect_fyers_websocket():
+    """Establishes and manages Fyers WebSocket connection for real-time data."""
+    global websocket_client
+
+    access_token = load_access_token()
+    if not access_token:
+        logger.error("No Fyers access token found for WebSocket connection. Skipping WS connection.")
+        return False
+
+    client_id_for_ws = FYERS_APP_ID
+    if "-" in FYERS_APP_ID:
+        client_id_for_ws = FYERS_APP_ID.split("-")[0] 
+
+    if websocket_client and websocket_client.is_connected:
+        logger.info("Fyers WebSocket already connected.")
+        return True
+    elif websocket_client: # Client object exists but not connected, attempt reconnect
+        logger.info("Fyers WebSocket not connected, but client exists. Attempting reconnect.")
+        try:
+            websocket_client.connect()
+            return True
+        except Exception as e:
+            logger.error(f"Error reconnecting Fyers WebSocket: {e}", exc_info=True)
+            websocket_client = None # Reset client object if reconnect fails
     
-    # Get the current month's futures symbol
-    current_futures_symbol = get_current_month_futures_symbol()
+    def on_open(ws_app):
+        logger.info("Fyers WebSocket connection opened.")
+        # Subscribe to all symbols defined in SYMBOLS_TO_MONITOR
+        ws_app.subscribe(symbols=SYMBOLS_TO_MONITOR, data_type="symbolData")
+        logger.info(f"Subscribed to symbols for real-time data: {SYMBOLS_TO_MONITOR}")
+
+    def on_message(ws_app, message):
+        global latest_prices, historical_data
+        # Process the received message and update the global latest_prices dictionary
+        if isinstance(message, dict) and "symbol" in message and "ltp" in message:
+            symbol = message["symbol"]
+            ltp = message["ltp"]
+            
+            latest_prices[symbol] = {
+                "ltp": ltp,
+                "timestamp": datetime.now().isoformat()
+            }
+            # Append to historical data deque for indicator calculations
+            if symbol in historical_data:
+                historical_data[symbol].append(ltp)
+            
+            # logger.debug(f"Updated LTP for {symbol}: {ltp}") # This can be very verbose
+
+    def on_error(ws_app, error):
+        logger.error(f"Fyers WebSocket error: {error}", exc_info=True)
+
+    def on_close(ws_app):
+        logger.info("Fyers WebSocket connection closed.")
+        global websocket_client
+        websocket_client = None
+
+    try:
+        os.makedirs(FYERS_WS_LOG_DIR, exist_ok=True) # Ensure WS log directory exists
+        websocket_client = data_ws.FyersDataSocket(
+            access_token=f"{client_id_for_ws}:{access_token}",
+            log_path=FYERS_WS_LOG_DIR, # Save WebSocket library logs to persistent disk
+            litemode=True, # Subscribe to basic LTP updates for symbols
+            on_message=on_message,
+            on_error=on_error,
+            on_close=on_close,
+            on_open=on_open,
+            enable_websocket_log=True
+        )
+        logger.info("Attempting to connect Fyers WebSocket...")
+        websocket_client.connect()
+        return True
+    except Exception as e:
+        logger.error(f"Failed to connect Fyers WebSocket: {e}", exc_info=True)
+        websocket_client = None
+        return False
+
+def close_fyers_websocket():
+    """Closes the Fyers WebSocket connection if open."""
+    global websocket_client
+    if websocket_client and websocket_client.is_connected:
+        logger.info("Closing Fyers WebSocket connection.")
+        websocket_client.close()
+        websocket_client = None
+
+
+# --- Market Hours Check ---
+def is_market_open():
+    """Checks if the Indian stock market (NSE/BSE) is currently open."""
+    ist = pytz.timezone('Asia/Kolkata')
+    now_utc = datetime.now(pytz.utc) # Get current UTC time, aware
+    now_ist = datetime.now(ist) # Get current IST time, aware
+
+    market_open_time = now_ist.replace(hour=9, minute=15, second=0, microsecond=0)
+    market_close_time = now_ist.replace(hour=15, minute=30, second=0, microsecond=0)
+
+    is_weekday = 0 <= now_ist.weekday() <= 4 # Monday (0) to Friday (4)
+
+    is_open = is_weekday and (market_open_time <= now_ist <= market_close_time)
     
-    # Initialize symbol_ticks for the futures symbol
-    initialize_tick_data_buffers([current_futures_symbol])
+    # --- ENHANCED DEBUGGING LOGS ---
+    logger.debug(f"DEBUG: Current UTC time (aware): {now_utc}")
+    logger.debug(f"DEBUG: Current IST time (aware): {now_ist}")
+    logger.debug(f"DEBUG: Market Open Time IST: {market_open_time}")
+    logger.debug(f"DEBUG: Market Close Time IST: {market_close_time}")
+    logger.debug(f"DEBUG: Is Weekday ({now_ist.strftime('%A')}): {is_weekday}")
+    logger.debug(f"DEBUG: Is Market Open calculated: {is_open}")
+    # --- END DEBUG LOGS ---
 
-    while algo_status_dict["status"] == "running":
-        if not is_market_open():
-            logger.info("Market is closed. Waiting for market open.")
-            # Disconnect WebSocket if market is closed to save resources
-            if websocket_client and websocket_client.is_connected:
-                logger.info("Market closed, closing Fyers WebSocket connection.")
-                websocket_client.close_connection() # Correct method to close the connection
-                websocket_client = None # Clear client
-            time.sleep(60) # Check every minute if market is closed
-            continue
-        
-        # If market just opened, reconnect WebSocket
-        if not websocket_client or not websocket_client.is_connected:
-            logger.info("Market is open, reconnecting Fyers WebSocket.")
-            websocket_client = start_fyers_websocket(access_token) # No need to pass logger here
-            if not websocket_client:
-                logger.error("Failed to reconnect WebSocket. Skipping this cycle.")
-                time.sleep(10) # Wait a bit before retrying
-                continue
-
-        processed_any_candle_in_this_iteration = False
-        
-        # Process futures candle for signal generation
-        futures_candle = last_completed_candles.get(current_futures_symbol)
-        
-        if futures_candle:
-            candle_timestamp = futures_candle[0] # Get timestamp of the completed candle
-
-            if current_futures_symbol in last_candle_processed_timestamp and candle_timestamp == last_candle_processed_timestamp[current_futures_symbol]:
-                pass # Already processed this candle, wait for a new one
-            else:
-                logger.info(f"Processing new candle for {current_futures_symbol}: {datetime.fromtimestamp(futures_candle[0])}")
-                last_candle_processed_timestamp[current_futures_symbol] = candle_timestamp
-                processed_any_candle_in_this_iteration = True
-
-                # IMPORTANT: Placeholder for actual historical data.
-                # In a real system, you'd use a `deque` of the last X candles.
-                num_required_candles = max(SUPER_TREND_PERIOD, SLOW_MA_PERIOD + SIGNAL_PERIOD)
-                # This will make indicators very volatile for a new connection/symbol
-                past_candles_for_indicators = [futures_candle] * num_required_candles 
-                # ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-                # CRITICAL AREA FOR IMPROVEMENT: Replace this with actual historical candle accumulation.
-                # For now, if you are testing, you might need to manually ensure enough "mock" candles are passed
-                # or wait for sufficient tick data to accumulate.
+    if not is_open:
+        if not is_weekday:
+            logger.debug(f"Market is closed: Weekend ({now_ist.strftime('%A')}).")
+        elif now_ist < market_open_time:
+            logger.debug(f"Market is closed: Before opening hours. Current IST: {now_ist.strftime('%H:%M:%S')}")
+        elif now_ist > market_close_time:
+            logger.debug(f"Market is closed: After closing hours. Current IST: {now_ist.strftime('%H:%M:%S')}")
+    else:
+        logger.debug(f"Market is OPEN. Current IST: {now_ist.strftime('%H:%M:%S')}")
+    
+    return is_open
 
 
-                # --- Strategy Logic ---
-                supertrend_values, supertrend_trend = calculate_supertrend(
-                    past_candles_for_indicators, SUPER_TREND_PERIOD, SUPER_TREND_MULTIPLIER
-                )
-                macd_line, signal_line, macd_histogram = calculate_macd(
-                    past_candles_for_indicators, FAST_MA_PERIOD, SLOW_MA_PERIOD, SIGNAL_PERIOD
-                )
+# --- Strategy Indicator Calculations (Placeholders for your existing logic) ---
+# Assuming your original code had functions like these.
+# You would implement the actual calculation logic here using 'historical_data' or other data sources.
 
-                if not supertrend_values or not macd_line or not supertrend_trend or not signal_line or not macd_histogram or \
-                   len(supertrend_values) < 1 or len(macd_line) < 1 or len(supertrend_trend) < 1 or len(signal_line) < 1 or len(macd_histogram) < 1:
-                    logger.warning(f"Indicators not calculated for {current_futures_symbol}. Skipping trade signal generation due to insufficient data or calculation error. ST:{len(supertrend_values)}, MACD:{len(macd_line)}")
-                    processed_any_candle_in_this_iteration = False 
+def calculate_ema(prices, period):
+    if len(prices) < period:
+        return None
+    ema = [0.0] * len(prices)
+    smoothing_factor = 2 / (period + 1)
+    
+    # Simple moving average for the first EMA calculation
+    ema[period - 1] = sum(prices[:period]) / period
+    
+    for i in range(period, len(prices)):
+        ema[i] = (prices[i] - ema[i-1]) * smoothing_factor + ema[i-1]
+    return ema[-1] # Return the latest EMA
+
+def calculate_rsi(prices, period=RSI_PERIOD):
+    if len(prices) < period + 1:
+        return None
+    
+    deltas = np.diff(prices)
+    gains = deltas[deltas > 0]
+    losses = -deltas[deltas < 0] # Losses are positive values
+
+    avg_gain = np.mean(gains[:period]) if len(gains) > 0 else 0
+    avg_loss = np.mean(losses[:period]) if len(losses) > 0 else 0
+
+    if avg_loss == 0:
+        return 100 if avg_gain > 0 else 50 # Avoid division by zero
+    
+    rs = avg_gain / avg_loss
+    rsi = 100 - (100 / (1 + rs))
+    return rsi
+
+def calculate_macd(prices, fast_period=MACD_FAST_PERIOD, slow_period=MACD_SLOW_PERIOD, signal_period=MACD_SIGNAL_PERIOD):
+    if len(prices) < max(fast_period, slow_period, signal_period):
+        return None, None, None
+
+    # This is a simplified calculation for the latest MACD, typically requires more historical EMAs
+    ema_fast = calculate_ema(prices, fast_period)
+    ema_slow = calculate_ema(prices, slow_period)
+
+    if ema_fast is None or ema_slow is None:
+        return None, None, None
+
+    macd_line = ema_fast - ema_slow
+    
+    # To calculate the MACD signal line, you'd need a series of MACD line values
+    # For now, we'll return None for signal and histogram unless a series is available.
+    # In a full implementation, you'd store a history of macd_line values and then calculate EMA of *that* for signal line.
+    
+    return macd_line, None, None # macd_line, signal_line, histogram
+
+
+# --- Core Algo Engine Functionality ---
+
+def execute_strategy(algo_status_dict, app_logger_instance):
+    """
+    Main function to execute the trading strategy. Runs in a separate thread.
+    algo_status_dict: A shared dictionary to control the algo's running state from the Flask app.
+    app_logger_instance: The Flask app's logger instance (optional, for Flask-specific logging within algo).
+    """
+    global fyers, websocket_client, current_capital_data, active_trades, latest_prices, historical_data
+
+    logger.info("Jannat Algo Engine thread started. Initializing...")
+    
+    current_capital_data = load_capital_data() # Load initial capital data
+
+    # Initialize Fyers REST client (for placing orders, etc.)
+    fyers = init_fyers_client()
+    if not fyers:
+        logger.error("Fyers REST client initialization failed. Algo will run in simulated trading mode only (no real orders).")
+        # Algo continues to run, but only simulates trades and updates local state.
+
+    # Connect WebSocket for real-time data streaming
+    connect_fyers_websocket()
+
+    logger.info(f"Starting with capital: {current_capital_data['current_balance']:.2f}")
+
+    # Main loop for the algo engine
+    while algo_status_dict.get("status") == "running":
+        try:
+            # --- Market Hours Check ---
+            if not is_market_open():
+                logger.info("Market is closed. Pausing algo activity and closing WebSocket.")
+                close_fyers_websocket()
+                time.sleep(60) # Wait for 1 minute before re-checking market status
+                continue # Skip trading logic until market re-opens
+            
+            # --- WebSocket Connection Check (if market is open) ---
+            if not websocket_client or not websocket_client.is_connected:
+                logger.warning("Market is OPEN, but WebSocket is not connected. Attempting to reconnect.")
+                connect_fyers_websocket() # Attempt to reconnect
+                if not websocket_client or not websocket_client.is_connected:
+                    logger.error("Failed to connect WebSocket. Real-time data will not be streamed for decisions.")
+                    time.sleep(30) # Wait before next attempt to avoid hammering
                     continue
 
-                latest_supertrend = supertrend_values[-1]
-                latest_supertrend_trend = supertrend_trend[-1] # 1 for up, -1 for down
-                latest_macd_line = macd_line[-1]
-                latest_signal_line = signal_line[-1]
-                latest_macd_histogram = macd_histogram[-1]
+            logger.info("Algo engine running: Market is open and WebSocket is active.")
 
-                current_futures_price_for_signal = futures_candle[4] # Use candle close as current price for this check
+            # --- YOUR TRADING STRATEGY GOES HERE ---
+            # This is where you will integrate your RSI, MACD, etc., logic.
+            # You now have access to 'latest_prices' and 'historical_data' from WebSocket.
 
-                logger.info(f"Strategy check for {current_futures_symbol}: ST: {latest_supertrend:.2f}, Trend: {latest_supertrend_trend}, MACD: {latest_macd_line:.2f}, Signal: {latest_signal_line:.2f}, Hist: {latest_macd_histogram:.2f}")
-
-                trade_signal = None
-                # Check for MACD Crossover and Histogram confirmation with Supertrend direction
-                # Supertrend Up, MACD Crosses Above Signal, Histogram positive
-                if latest_supertrend_trend == 1 and latest_macd_line > latest_signal_line and latest_macd_histogram > 0:
-                    trade_signal = 'BUY'
-                # Supertrend Down, MACD Crosses Below Signal, Histogram negative
-                elif latest_supertrend_trend == -1 and latest_macd_line < latest_signal_line and latest_macd_histogram < 0:
-                    trade_signal = 'SELL'
+            for symbol in SYMBOLS_TO_MONITOR:
+                current_ltp_info = latest_prices.get(symbol)
                 
-                # VIX filter (placeholder)
-                # if not filter_high_vix(current_vix_value): 
-                #     logger.info("High VIX detected. Not placing trades.")
-                #     trade_signal = None
+                if not current_ltp_info:
+                    logger.debug(f"No real-time data for {symbol} yet. Skipping strategy for this symbol.")
+                    continue
 
+                current_ltp = current_ltp_info["ltp"]
+                
+                # Ensure enough historical data for calculations
+                if len(historical_data[symbol]) < max(EMA_SLOW_PERIOD, RSI_PERIOD, MACD_SLOW_PERIOD) + 1:
+                    logger.info(f"Collecting historical data for {symbol}. Current points: {len(historical_data[symbol])}/{WINDOW_SIZE}")
+                    # Continue collecting data; strategy won't activate until enough data points.
+                    continue
+                
+                # --- Calculate Indicators ---
+                # Example: You would use historical_data[symbol] (which is a deque of prices)
+                # to calculate your indicators.
+                prices_list = list(historical_data[symbol]) # Convert deque to list for numpy/slicing
+                
+                # Replace with your actual indicator calculations
+                current_rsi = calculate_rsi(prices_list)
+                macd_line, macd_signal_line, macd_histogram = calculate_macd(prices_list)
+                
+                logger.debug(f"Symbol: {symbol}, LTP: {current_ltp:.2f}, RSI: {current_rsi:.2f} (if calculated), MACD: {macd_line:.2f} (if calculated)")
 
-                if trade_signal and len(active_trades) < MAX_ACTIVE_TRADES:
-                    logger.info(f"Strong trade signal detected for {current_futures_symbol}: {trade_signal}")
+                # --- Trade Decision Logic (Based on your strategies) ---
+                # Iterate through active trades to manage existing positions
+                current_trade_for_symbol = next((trade for trade in active_trades if trade['symbol'] == symbol and trade['status'] == 'ACTIVE'), None)
 
-                    # Determine ATM strike and option symbol
-                    atm_strike = get_current_atm_strike(current_futures_price_for_signal, BANKNIFTY_STRIKE_INTERVAL)
-                    expiry_date = get_nearest_expiry_date(OPTION_EXPIRY_DAYS_AHEAD)
-                    is_call = True if trade_signal == 'BUY' else False # Buy Call for BUY, Buy Put for SELL
-                    option_symbol = get_current_option_symbol(SYMBOL_SPOT_BASE_NAME, expiry_date, is_call, atm_strike)
+                if current_trade_for_symbol:
+                    # Logic for managing existing trades (SL/Target)
+                    # Use current_ltp for real-time evaluation
+                    if current_trade_for_symbol["signal"] == "BUY":
+                        if current_ltp >= current_trade_for_symbol["target_price"]:
+                            logger.info(f"TARGET HIT for {symbol}! Exiting BUY trade.")
+                            current_trade_for_symbol["status"] = "CLOSED"
+                            current_trade_for_symbol["exit_price"] = current_ltp # Exit at current real-time price
+                            current_trade_for_symbol["pnl"] = (current_trade_for_symbol["exit_price"] - current_trade_for_symbol["entry_price"]) * current_trade_for_symbol["quantity"]
+                            current_trade_for_symbol["exit_reason"] = "Target Hit"
+                            current_trade_for_symbol["exit_time"] = datetime.now().isoformat()
+                            current_capital_data["pnl_today"] += current_trade_for_symbol["pnl"]
+                            current_capital_data["current_balance"] += (current_trade_for_symbol["exit_price"] * current_trade_for_symbol["quantity"])
+                            log_trade(current_trade_for_symbol)
+                            active_trades.remove(current_trade_for_symbol)
+                            save_capital_data(current_capital_data) # Save updated capital
+                            # --- Placeholder for Actual Fyers Order Placement ---
+                            # Example: Place a SELL order to close position
+                            # payload = { "symbol": symbol, "qty": current_trade_for_symbol["quantity"], "type": 1, "side": -1, "productType": "CNC", "validity": "DAY" }
+                            # if fyers:
+                            #     try: response = fyers.place_order(payload=payload); logger.info(f"Fyers exit order response: {response}")
+                            #     except Exception as api_e: logger.error(f"Fyers API exit order error: {api_e}")
+
+                        elif current_ltp <= current_trade_for_symbol["stop_loss_price"]:
+                            logger.info(f"STOP LOSS HIT for {symbol}! Exiting BUY trade.")
+                            current_trade_for_symbol["status"] = "CLOSED"
+                            current_trade_for_symbol["exit_price"] = current_ltp # Exit at current real-time price
+                            current_trade_for_symbol["pnl"] = (current_trade_for_symbol["exit_price"] - current_trade_for_symbol["entry_price"]) * current_trade_for_symbol["quantity"]
+                            current_trade_for_symbol["exit_reason"] = "Stop Loss Hit"
+                            current_trade_for_symbol["exit_time"] = datetime.now().isoformat()
+                            current_capital_data["pnl_today"] += current_trade_for_symbol["pnl"]
+                            current_capital_data["current_balance"] += (current_trade_for_symbol["exit_price"] * current_trade_for_symbol["quantity"])
+                            log_trade(current_trade_for_symbol)
+                            active_trades.remove(current_trade_for_symbol)
+                            save_capital_data(current_capital_data) # Save updated capital
+                            # --- Placeholder for Actual Fyers Order Placement ---
+                            # Example: Place a SELL order to close position
+                            # payload = { "symbol": symbol, "qty": current_trade_for_symbol["quantity"], "type": 1, "side": -1, "productType": "CNC", "validity": "DAY" }
+                            # if fyers:
+                            #     try: response = fyers.place_order(payload=payload); logger.info(f"Fyers exit order response: {response}")
+                            #     except Exception as api_e: logger.error(f"Fyers API exit order error: {api_e}")
                     
-                    target_symbol_to_trade = option_symbol # This is the option symbol to trade
+                    # Add similar logic for "SELL" trades if you implement shorting
 
-                    # Subscribe to the specific option symbol if not already subscribed
-                    if target_symbol_to_trade not in latest_prices and websocket_client:
-                        try:
-                            logger.info(f"Dynamically subscribing to option symbol for trade: {target_symbol_to_trade}")
-                            websocket_client.subscribe(symbols=[target_symbol_to_trade], data_type="symbolData")
-                            time.sleep(1.5) # Give a moment for initial tick to arrive
-                        except Exception as e:
-                            logger.error(f"Failed to subscribe to option symbol {target_symbol_to_trade} dynamically: {e}", exc_info=True)
-                            continue # Skip this trade if subscription fails
+                else: # No active trade for this symbol, look for new entry signals
+                    # --- Entry Signal Logic (Use your calculated indicators here) ---
+                    # Example: Simple RSI based entry (REPLACE THIS WITH YOUR ACTUAL STRATEGY)
+                    if current_rsi is not None and current_rsi < 30 and current_ltp > 0: # Simple oversold BUY signal
+                        logger.info(f"BUY signal detected for {symbol} (RSI: {current_rsi:.2f}). Planning trade.")
+                        
+                        # Define trade parameters based on current_ltp and your risk management
+                        entry_price = current_ltp
+                        quantity_to_buy = 1 # Example quantity, calculate based on capital
+                        stop_loss_price = entry_price * (1 - STOP_LOSS_PERCENT)
+                        target_price = entry_price * (1 + TARGET_PERCENT)
 
-                    # Fetch option_current_price from latest_prices for entry
-                    option_current_price = latest_prices.get(target_symbol_to_trade)
-                    if option_current_price is None:
-                        logger.warning(f"No real-time price available for {target_symbol_to_trade} after subscription. Skipping order placement for this signal.")
-                        continue # Skip this trade if no real-time price after attempting subscription
+                        if current_capital_data["current_balance"] >= (entry_price * quantity_to_buy):
+                            new_trade = {
+                                "order_id": f"SIM_ORDER_{int(time.time())}_{symbol.replace(':', '_')}",
+                                "symbol": symbol,
+                                "signal": "BUY",
+                                "entry_price": entry_price,
+                                "quantity": quantity_to_buy,
+                                "target_price": target_price,
+                                "stop_loss_price": stop_loss_price,
+                                "status": "ACTIVE",
+                                "entry_time": datetime.now().isoformat()
+                            }
+                            active_trades.append(new_trade)
+                            current_capital_data["current_balance"] -= (entry_price * quantity_to_buy) # Simulate capital deduction
+                            save_capital_data(current_capital_data) # Save updated capital
+                            logger.info(f"Simulated BUY trade placed for {symbol} @ {entry_price:.2f}. SL: {stop_loss_price:.2f}, Target: {target_price:.2f}")
+
+                            # --- Placeholder for Actual Fyers Order Placement ---
+                            # payload = {
+                            #     "symbol": symbol, "qty": quantity_to_buy, "type": 1, # Type 1 = Market Order
+                            #     "side": 1, # Side 1 = BUY
+                            #     "productType": "CNC", # Or "MARGIN", "INTRADAY" etc.
+                            #     "validity": "DAY",
+                            #     "stopLoss": stop_loss_price, # Add SL for real order
+                            #     "takeProfit": target_price # Add Target for real order
+                            # }
+                            # if fyers:
+                            #     try:
+                            #         response = fyers.place_order(payload=payload)
+                            #         logger.info(f"Fyers order response for {symbol}: {response}")
+                            #         # Update new_trade with actual order_id from response
+                            #     except Exception as api_e:
+                            #         logger.error(f"Fyers API order placement error for {symbol}: {api_e}", exc_info=True)
+                            # else:
+                            #     logger.warning(f"Fyers REST client not initialized. Cannot place real orders for {symbol}.")
+                        else:
+                            logger.warning(f"Insufficient capital to place simulated BUY trade for {symbol}.")
                     
-                    logger.info(f"Real-time option price for {target_symbol_to_trade}: {option_current_price:.2f}")
+                    # Add your other entry strategies (e.g., MACD cross, EMA cross) here
+                    # elif ... : # Your other entry conditions
 
-                    product_type = "MIS" # Margin Intraday Square off
-                    order_type = "MARKET" # Or "LIMIT" if you want to specify entry_price
-                    quantity = TRADE_QUANTITY_PER_LOT_BANKNIFTY 
 
-                    entry_price = option_current_price # Assume market order, so entry is current price
-
-                    calculated_target = entry_price * (1 + TARGET_MULTIPLIER) if trade_signal == 'BUY' else entry_price * (1 - TARGET_MULTIPLIER)
-                    calculated_stop_loss = entry_price * (1 - STOP_LOSS_MULTIPLIER) if trade_signal == 'BUY' else entry_price * (1 + STOP_LOSS_MULTIPLIER)
-
-                    logger.info(f"Attempting to place {trade_signal} trade for {target_symbol_to_trade} @ {entry_price:.2f} (Target: {calculated_target:.2f}, SL: {calculated_stop_loss:.2f})")
-
-                    # Place order
-                    success, order_id = place_order_api(
-                        target_symbol_to_trade,
-                        1 if trade_signal == 'BUY' else -1, # side: 1 for BUY, -1 for SELL
-                        quantity,
-                        product_type,
-                        order_type,
-                        price=entry_price,
-                        trade_mode='PAPER' # Change to 'LIVE' for live trading
-                    )
-
-                    if success:
-                        trade_details_for_monitoring = {
-                            "order_id": order_id,
-                            "symbol": target_symbol_to_trade,
-                            "signal": trade_signal,
-                            "entry_time": datetime.now().isoformat(),
-                            "entry_price": entry_price,
-                            "target_price": calculated_target,
-                            "stop_loss_price": calculated_stop_loss,
-                            "quantity": quantity,
-                            "product_type": product_type,
-                            "order_type": order_type,
-                            "trade_mode": 'PAPER', 
-                            "status": "ACTIVE"
-                        }
-                        active_trades[target_symbol_to_trade] = trade_details_for_monitoring
-                        log_trade(trade_details_for_monitoring)
-                        logger.info(f"Trade placed successfully for {target_symbol_to_trade}. Now monitoring...")
-
-                    else:
-                        logger.error("Failed to place trade.")
+            # --- Update PnL for active trades for dashboard display ---
+            # Calculate and update PnL for active trades based on latest_prices
+            total_current_pnl = 0.0
+            for trade in active_trades:
+                latest_ltp = latest_prices.get(trade['symbol'], {}).get('ltp')
+                if latest_ltp:
+                    if trade["signal"] == "BUY":
+                        trade["current_pnl"] = (latest_ltp - trade["entry_price"]) * trade["quantity"]
+                    elif trade["signal"] == "SELL": # If you implement shorting
+                        trade["current_pnl"] = (trade["entry_price"] - latest_ltp) * trade["quantity"]
+                    total_current_pnl += trade["current_pnl"]
                 else:
-                    if trade_signal:
-                        logger.info(f"Trade signal for {current_futures_symbol} but maximum active trades ({MAX_ACTIVE_TRADES}) reached.")
-                    else:
-                        logger.debug("No strong trade signal or filter condition not met for current candle.")
-        else:
-            logger.debug(f"No new completed futures candle for {current_futures_symbol} available yet. Waiting for ticks...")
-        
-        # After processing signals, check/monitor active trades
-        for symbol, trade_obj in list(active_trades.items()): 
-            monitor_and_manage_trade(trade_obj)
-        
-        # Small sleep if no new candle was processed to prevent busy-waiting
-        if not processed_any_candle_in_this_iteration:
-            time.sleep(1) 
+                    trade["current_pnl"] = 0.0 # No latest price yet
 
-# --- Bonus Intelligence Functions (Placeholders) ---
-def filter_high_vix(vix_value):
-    """
-    Placeholder for VIX filter.
-    Requires fetching VIX data from an external source and defining a threshold.
-    e.g., if vix_value > 20: return False (do not trade in high volatility)
-    """
-    return True # Always allow for now. Implement real VIX check later.
+            # This updates the pnl_today for display on the frontend
+            # The pnl_today should reflect both closed trades and current open trade PnL
+            # For simplicity, we are adding total_current_pnl to the initial pnl_today here,
+            # but a more robust system would distinguish realized vs unrealized PnL.
+            # For now, it represents the total PnL including unrealized gains/losses.
+            initial_pnl_today_from_closed_trades = sum(t["pnl"] for t in log_trade_history if t["status"] == "CLOSED" and "exit_time" in t and datetime.fromisoformat(t["exit_time"]).date() == datetime.now().date())
+            current_capital_data["pnl_today"] = initial_pnl_today_from_closed_trades + total_current_pnl
 
-def get_current_spot_price(symbol):
-    """
-    Returns the latest known price for a symbol from the real-time tick data.
-    """
-    global latest_prices
-    return latest_prices.get(symbol) # Safely get price, returns None if not found
+            save_capital_data(current_capital_data) # Save capital data with updated PnL
 
+            # --- End of Trading Strategy and PnL Update ---
 
-# --- Initial Setup for direct run (for testing purposes) ---
-if __name__ == "__main__":
-    # When running directly, use the configured logging system
-    print("Running Jannat Algo Engine directly for testing.")
+            time.sleep(5) # The algo loop runs every 5 seconds (adjust as needed for your strategy responsiveness)
+
+        except Exception as e:
+            logger.error(f"Error in execute_strategy main loop: {e}", exc_info=True)
+            time.sleep(10) # Pause for 10 seconds on error to prevent rapid failures
+
+    logger.info("Jannat Algo Engine stopped.")
+    close_fyers_websocket() # Ensure WebSocket is closed when algo stops
+
+# --- Functions to expose Algo Data to Flask Backend (for frontend) ---
+# These functions are called by `app.py` to get data for the dashboard.
+
+def get_trade_details():
+    """
+    Returns a list of currently active trades.
+    Also, add PnL from closed trades for today.
+    """
+    # Load all trades from log to filter for today's closed trades for PnL aggregation
+    trades_from_log = []
+    if os.path.exists(TRADE_LOG_FILE):
+        try:
+            with open(TRADE_LOG_FILE, 'r') as f:
+                content = f.read()
+                if content:
+                    trades_from_log = json.loads(content)
+        except (json.JSONDecodeError, FileNotFoundError):
+            logger.warning(f"Could not load or parse trade log file: {TRADE_LOG_FILE}")
+            trades_from_log = []
+
+    # Get today's date for filtering
+    today = datetime.now().date()
     
-    # Simulate algo_status_dict for direct execution
-    mock_algo_status_dict = {"status": "running", "last_update": datetime.now().isoformat()}
+    # Filter for trades closed today to show historical PnL in trade details
+    closed_trades_today = [
+        trade for trade in trades_from_log 
+        if trade.get("status") == "CLOSED" and "exit_time" in trade and datetime.fromisoformat(trade["exit_time"]).date() == today
+    ]
+    
+    # Combine active trades with closed trades for display, or maintain separate lists
+    # For simplicity, returning active_trades as is, as it's the primary "real-time" view.
+    # The frontend can call get_capital_data() for aggregated PnL today.
+    return active_trades
 
-    # Set up dummy environment variables for local testing without actual Fyers credentials
+def get_capital_data():
+    """Returns current capital and PnL data."""
+    return current_capital_data
+
+# --- Initial Setup on Module Load ---
+# Ensure directories for persistent data are created when the module is first loaded.
+logger.info(f"Ensuring persistent disk directories exist at {PERSISTENT_DISK_BASE_PATH}...")
+os.makedirs(PERSISTENT_DISK_BASE_PATH, exist_ok=True)
+os.makedirs(os.path.dirname(ACCESS_TOKEN_STORAGE_FILE), exist_ok=True)
+os.makedirs(os.path.dirname(CAPITAL_FILE), exist_ok=True)
+os.makedirs(os.path.dirname(TRADE_LOG_FILE), exist_ok=True)
+os.makedirs(os.path.dirname(ALGO_LOG_FILE), exist_ok=True)
+os.makedirs(FYERS_WS_LOG_DIR, exist_ok=True) # Ensure WebSocket log directory exists
+logger.info("Persistent disk directories ensured.")
+
+# Load trade history for PnL calculation on restart
+log_trade_history = []
+if os.path.exists(TRADE_LOG_FILE):
+    try:
+        with open(TRADE_LOG_FILE, 'r') as f:
+            content = f.read()
+            if content:
+                log_trade_history = json.loads(content)
+    except (json.JSONDecodeError, FileNotFoundError):
+        logger.warning(f"Could not load or parse trade log file {TRADE_LOG_FILE} on startup.")
+
+
+# --- Standalone Execution Block (for local testing without Flask app) ---
+if __name__ == '__main__':
+    logger.info("Running Jannat Algo Engine in standalone mode (for direct testing).")
+    
+    # Set up dummy environment variables for local testing
     os.environ["FYERS_APP_ID"] = "dummy_app_id"
     os.environ["FYERS_SECRET_ID"] = "dummy_secret"
     os.environ["FYERS_REDIRECT_URI"] = "http://localhost:5000/fyers_auth_callback"
@@ -888,12 +656,26 @@ if __name__ == "__main__":
 
     # Create dummy directories if they don't exist
     os.makedirs(os.path.dirname(ACCESS_TOKEN_STORAGE_FILE), exist_ok=True)
+    os.makedirs(os.path.dirname(CAPITAL_FILE), exist_ok=True)
+    os.makedirs(os.path.dirname(TRADE_LOG_FILE), exist_ok=True)
+    os.makedirs(os.path.dirname(ALGO_LOG_FILE), exist_ok=True)
     os.makedirs(FYERS_WS_LOG_DIR, exist_ok=True)
 
-    # Create a dummy access token file for testing purposes
+    # Create a dummy access token file for testing purposes if it doesn't exist
     if not os.path.exists(ACCESS_TOKEN_STORAGE_FILE):
         with open(ACCESS_TOKEN_STORAGE_FILE, 'w') as f:
             json.dump({"access_token": "YOUR_DUMMY_FYERS_ACCESS_TOKEN_FOR_TESTING_ONLY"}, f)
-        print(f"Created dummy access token file at {ACCESS_TOKEN_STORAGE_FILE}. Replace with real token for live trading.")
+        logger.info(f"Created dummy access token file at {ACCESS_TOKEN_STORAGE_FILE}")
 
-    execute_strategy(mock_algo_status_dict, None) # Pass None for app_logger_instance as it's not used
+    # Create a dummy capital file for testing purposes if it doesn't exist
+    if not os.path.exists(CAPITAL_FILE):
+        save_capital_data({"current_balance": BASE_CAPITAL, "pnl_today": 0.0})
+        logger.info(f"Created dummy capital file at {CAPITAL_FILE}")
+
+    # Simulate algo_status_dict for direct execution
+    mock_algo_status_dict = {"status": "running", "last_update": datetime.now().isoformat()}
+
+    # Call the main strategy execution function
+    execute_strategy(mock_algo_status_dict, logging.getLogger("DummyAppLogger"))
+    
+    logger.info("Standalone algo execution finished.")
