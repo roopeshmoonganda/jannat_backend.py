@@ -1,249 +1,446 @@
-from flask import Flask, jsonify, request, redirect, url_for
-from flask_cors import CORS
-import threading
-import json
 import os
+import json
+import time
 from datetime import datetime, timedelta
-import logging # Import logging module for Flask app
+import requests
+import math
+import numpy as np
+from collections import deque
+import threading
+import logging # Import logging module
 import sys # Import sys module for stdout
+import pytz # For timezone-aware market hours
 
-# Import your algo engine functions and its logger
-# Note: The algo_engine_logger is imported but the algo engine
-# is now configured to log directly to sys.stdout and a file.
-# The app.logger will still be used for Flask-specific logs.
-from jannat_algo_engine import execute_strategy, get_trade_details, get_capital_data
+# --- Fyers API V3 Imports ---
+from fyers_apiv3 import fyersModel
+from fyers_apiv3.FyersWebsocket import data_ws
 
-app = Flask(__name__)
-CORS(app) # Enable CORS for frontend communication
+# --- Configuration ---
+# Use environment variable for Flask backend URL, default for local testing
+FLASK_BACKEND_URL = os.environ.get("FLASK_BACKEND_URL", "https://jannat-backend-py.onrender.com")
 
-# --- Flask App Logging Configuration ---
-# Get the logger for the Flask app
-app.logger.setLevel(logging.INFO) # Set default log level for Flask app
-# Remove default handler if it exists to avoid duplicate logs in some environments
-if app.logger.handlers:
-    for handler in app.logger.handlers:
-        app.logger.removeHandler(handler)
-        handler.close() # Important: close file handlers to release locks
-
-# Add a StreamHandler to output Flask logs to stdout
-flask_stream_handler = logging.StreamHandler(sys.stdout)
-flask_stream_handler.setFormatter(logging.Formatter('[%(asctime)s] %(levelname)s in %(name)s: %(message)s'))
-app.logger.addHandler(flask_stream_handler)
-
-
-# --- Configuration (ensure this matches jannat_algo_engine.py) ---
 # This path must match the persistent disk mount path configured in Render
-PERSISTENT_DISK_BASE_PATH = os.environ.get("PERSISTENT_DISK_PATH", "/var/data")
-ACCESS_TOKEN_STORAGE_FILE = os.path.join(PERSISTENT_DISK_BASE_PATH, "fyers_access_token.json")
-TRADE_LOG_FILE = os.path.join(PERSISTENT_DISK_BASE_PATH, "jannat_trade_log.json") # Assuming this is where past trades are saved
-ALGO_ENGINE_LOG_FILE = os.path.join(PERSISTENT_DISK_BASE_PATH, "jannat_algo_engine.log")
+# Set this as an environment variable in Render for your service, e.g., /var/data
+PERSISTENT_DISK_BASE_PATH = os.environ.get("PERSISTENT_DISK_PATH", "./jannat_data") # Default to local folder for testing
 
-# --- Fyers API Credentials (from environment variables) ---
+# Fyers API credentials (pulled from environment variables)
 FYERS_APP_ID = os.environ.get("FYERS_APP_ID")
 FYERS_SECRET_ID = os.environ.get("FYERS_SECRET_ID")
-FYERS_REDIRECT_URI = os.environ.get("FYERS_REDIRECT_URI") # This should point to your Render backend URL, e.g., https://your-service.onrender.com/fyers_auth_callback
+FYERS_REDIRECT_URI = os.environ.get("FYERS_REDIRECT_URI") # e.g., https://your-backend-service.onrender.com/fyers_auth_callback
 
-# Global dictionary to control algo thread status
-algo_status_dict = {"status": "stopped", "last_update": datetime.now().isoformat()}
-algo_thread = None # Global variable to hold the algo thread instance
+# File paths for persistent storage on Render's disk or local directory
+ACCESS_TOKEN_STORAGE_FILE = os.path.join(PERSISTENT_DISK_BASE_PATH, "fyers_access_token.json")
+CAPITAL_FILE = os.path.join(PERSISTENT_DISK_BASE_PATH, "jannat_capital.json")
+TRADE_LOG_FILE = os.path.join(PERSISTENT_DISK_BASE_PATH, "jannat_trade_log.json")
+ALGO_LOG_FILE = os.path.join(PERSISTENT_DISK_BASE_PATH, "jannat_algo_engine.log")
 
-# --- Fyers Authentication Endpoints ---
-@app.route('/login')
-def login():
-    """Initiates the Fyers authentication process."""
-    if not FYERS_APP_ID or not FYERS_REDIRECT_URI:
-        app.logger.error("Fyers APP_ID or REDIRECT_URI not set in environment variables.")
-        return jsonify({"error": "Fyers API credentials not configured"}), 500
+# Define a separate directory for Fyers WebSocket logs
+FYERS_WS_LOG_DIR = os.path.join(PERSISTENT_DISK_BASE_PATH, "fyers_ws_logs")
 
-    # Assuming fyersModel is imported and available, it's used for generating login URL
-    # This requires an instance of FyersModel for session handling, which is usually created during token generation
-    # For login URL, we need to create a temporary session model
-    try:
-        from fyers_apiv3 import fyersModel # Import here to avoid circular dependency if algo_engine imports app.py parts
-        session = fyersModel.SessionModel(
-            client_id=FYERS_APP_ID,
-            redirect_uri=FYERS_REDIRECT_URI,
-            response_type='code',
-            state='sample_state', # A state parameter to prevent CSRF, can be dynamic
-            secret_key=FYERS_SECRET_ID, # Secret key needed for token generation, but often for authcode only client_id/redirect_uri are exposed
-            grant_type='authorization_code'
-        )
-        generate_authcode_url = session.generate_authcode()
-        app.logger.info(f"Redirecting for Fyers authentication: {generate_authcode_url}")
-        return redirect(generate_authcode_url)
-    except Exception as e:
-        app.logger.error(f"Error generating Fyers authcode URL: {e}")
-        return jsonify({"error": f"Failed to generate Fyers login URL: {e}"}), 500
+# Trading Parameters (from your original snippet, maintain these)
+BASE_CAPITAL = 100000.0
+# Define the symbols your strategies will trade and monitor
+# Ensure these are valid Fyers symbols (e.g., "NSE:RELIANCE-EQ", "NSE:NIFTY50-INDEX")
+# This will be used for WebSocket subscription and strategy.
+SYMBOLS_TO_MONITOR = ["NSE:NIFTY50-INDEX", "NSE:BANKNIFTY-INDEX", "NSE:RELIANCE-EQ"]
+# You would define your actual trading symbols here, e.g.,
+# TRADING_SYMBOLS = ["NSE:RELIANCE-EQ", "NSE:INFY-EQ"]
 
+WINDOW_SIZE = 100 # For storing historical data if needed for indicators
+EMA_FAST_PERIOD = 9
+EMA_SLOW_PERIOD = 26
+RSI_PERIOD = 14
+MACD_FAST_PERIOD = 12
+MACD_SLOW_PERIOD = 26
+MACD_SIGNAL_PERIOD = 9
+STOP_LOSS_PERCENT = 0.005  # 0.5%
+TARGET_PERCENT = 0.01      # 1%
 
-@app.route('/fyers_auth_callback')
-def fyers_auth_callback():
-    """Handles the callback from Fyers after successful authentication."""
-    auth_code = request.args.get('auth_code')
-    if not auth_code:
-        error = request.args.get('error')
-        app.logger.error(f"Fyers authentication failed or no auth_code received. Error: {error}")
-        return jsonify({"status": "Failed", "message": f"Authentication failed: {error}"}), 400
+# --- Configure Logging for Algo Engine ---
+# This setup sends logs to both stdout (for Render's console) and a persistent file.
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.DEBUG) # Set to DEBUG to capture all messages
 
-    app.logger.info(f"Received auth_code: {auth_code}")
+# Clear existing handlers to prevent duplicate output if this block runs multiple times (e.g., in development)
+if logger.handlers:
+    for handler in logger.handlers:
+        logger.removeHandler(handler)
+        handler.close() # Important: close file handlers to release file locks
 
-    try:
-        from fyers_apiv3 import fyersModel
-        session = fyersModel.SessionModel(
-            client_id=FYERS_APP_ID,
-            secret_key=FYERS_SECRET_ID,
-            redirect_uri=FYERS_REDIRECT_URI,
-            response_type='code',
-            grant_type='authorization_code'
-        )
-        session.set_token(auth_code)
-        response = session.generate_token()
+# Create a StreamHandler to output logs to stdout
+stream_handler = logging.StreamHandler(sys.stdout)
+stream_handler.setFormatter(logging.Formatter('[%(asctime)s] %(levelname)s in %(name)s: %(message)s'))
+logger.addHandler(stream_handler)
 
-        if response.get("code") == 200 and response.get("access_token"):
-            access_token = response["access_token"]
-            app.logger.info("Access token generated successfully.")
-
-            # Ensure the directory exists before saving
-            os.makedirs(os.path.dirname(ACCESS_TOKEN_STORAGE_FILE), exist_ok=True)
-            with open(ACCESS_TOKEN_STORAGE_FILE, 'w') as f:
-                json.dump({"access_token": access_token}, f)
-            app.logger.info(f"Access token saved to {ACCESS_TOKEN_STORAGE_FILE}")
-            return jsonify({"status": "Success", "message": "Fyers authenticated and token saved."}), 200
-        else:
-            app.logger.error(f"Failed to generate access token: {response}")
-            return jsonify({"status": "Failed", "message": f"Failed to generate access token: {response.get('message', 'Unknown error')}"}), 500
-    except Exception as e:
-        app.logger.error(f"Error during Fyers token generation: {e}")
-        return jsonify({"status": "Error", "message": f"Token generation error: {e}"}), 500
-
-# --- Algo Engine Control Endpoints ---
-@app.route('/start_algo', methods=['GET', 'POST'])
-def start_algo():
-    global algo_thread, algo_status_dict
-    # Check if thread is already running or if status is 'running' but thread is dead
-    if algo_status_dict["status"] == "running" and algo_thread and algo_thread.is_alive():
-        app.logger.info("Attempted to start algo, but it's already running.")
-        return jsonify({"status": "Algo already running"}), 200
-
-    try:
-        # The algo_status_dict allows the algo engine to check its own status and stop
-        # app.logger is passed for compatibility, but the algo engine now uses its own configured logger
-        algo_thread = threading.Thread(target=execute_strategy, args=(algo_status_dict, app.logger,))
-        algo_thread.daemon = True # Allows Flask app to exit gracefully even if algo thread is running
-        algo_thread.start()
-        algo_status_dict["status"] = "running"
-        algo_status_dict["last_update"] = datetime.now().isoformat()
-        app.logger.info("Algo engine started in background thread.")
-        return jsonify({"status": "Algo Started"}), 200
-    except Exception as e:
-        app.logger.error(f"Error starting algo: {e}", exc_info=True) # Log traceback
-        # Reset status if starting failed
-        algo_status_dict["status"] = "stopped"
-        return jsonify({"status": "Error", "message": f"Failed to start algo: {e}"}), 500
-
-@app.route('/stop_algo', methods=['GET', 'POST'])
-def stop_algo():
-    global algo_status_dict, algo_thread
-    if algo_status_dict["status"] == "stopped":
-        app.logger.info("Attempted to stop algo, but it's already stopped.")
-        return jsonify({"status": "Algo already stopped"}), 200
-
-    app.logger.info("Stopping algo engine initiated.")
-    algo_status_dict["status"] = "stopped" # This signal will stop the loop in execute_strategy
-    algo_status_dict["last_update"] = datetime.now().isoformat()
-
-    # Optional: Wait for the thread to actually finish for graceful shutdown.
-    # Be careful with `join()` in a web server context as it can block the request.
-    # if algo_thread and algo_thread.is_alive():
-    #     app.logger.info("Waiting for algo thread to terminate...")
-    #     algo_thread.join(timeout=5) # Wait up to 5 seconds for thread to finish
-    #     if algo_thread.is_alive():
-    #         app.logger.warning("Algo thread did not terminate gracefully within timeout.")
-    #     else:
-    #         app.logger.info("Algo thread terminated gracefully.")
-
-    return jsonify({"status": "Algo Stopped"}), 200
+# Create a FileHandler to output logs to a persistent file
+try:
+    os.makedirs(os.path.dirname(ALGO_LOG_FILE), exist_ok=True)
+    file_handler = logging.FileHandler(ALGO_LOG_FILE)
+    file_handler.setFormatter(logging.Formatter('[%(asctime)s] %(levelname)s in %(name)s: %(message)s'))
+    logger.addHandler(file_handler)
+    logger.info(f"Algo Engine logging to persistent file: {ALGO_LOG_FILE}")
+except Exception as e:
+    logger.error(f"Failed to set up file logger in jannat_algo_engine: {e}", exc_info=True)
 
 
-# --- Frontend Data Endpoints ---
+# --- Global Variables for Algo State and Data ---
+current_capital_data = {"current_balance": 0.0, "pnl_today": 0.0} # Managed by algo, exposed to frontend
+active_trades = [] # List of dictionaries for currently active (open) trades
+fyers = None # Fyers API client instance for REST calls (e.g., placing orders)
+websocket_client = None # Fyers WebSocket client instance for real-time data
+latest_prices = {} # Dictionary to store latest prices from WebSocket: {'symbol': {'ltp': price, 'timestamp': time_str}}
 
-@app.route('/api/status', methods=['GET'])
-def get_algo_status():
-    """Returns the current status of the algo engine."""
-    global algo_status_dict
-    return jsonify(algo_status_dict), 200
+# Data structures for your strategy (from your snippet)
+historical_data = {symbol: deque(maxlen=WINDOW_SIZE) for symbol in SYMBOLS_TO_MONITOR}
+trade_signals_queue = deque(maxlen=100) # Assuming this is used for signals
 
-@app.route('/api/capital', methods=['GET'])
-def get_current_capital():
-    """Returns current capital data (balance, pnl_today, etc.)."""
-    capital_data = get_capital_data() # Assuming this function exists in jannat_algo_engine
-    return jsonify(capital_data), 200
 
-@app.route('/api/active_trades', methods=['GET'])
-def get_current_active_trades():
-    """Returns a list of currently active trades."""
-    active_trades = get_trade_details() # Assuming this function exists in jannat_algo_engine
-    return jsonify(active_trades), 200
+# --- Helper Functions for Persistence ---
 
-@app.route('/api/past_trades', methods=['GET'])
-def get_historical_trades():
-    """Returns a list of historical (closed) trades from the JSON log file."""
-    if not os.path.exists(TRADE_LOG_FILE):
-        return jsonify([]), 200 # Return empty list if file doesn't exist
-
-    try:
-        with open(TRADE_LOG_FILE, 'r') as f:
-            content = f.read()
-            if not content: # Handle empty file
-                return jsonify([]), 200
-            trade_log = json.loads(content)
-            # Ensure proper date/time format for frontend if needed, e.g., convert to ISO format
-            # For simplicity, returning as is, assuming frontend handles date parsing
-            return jsonify(trade_log), 200
-    except json.JSONDecodeError:
-        app.logger.error(f"Error decoding trade log JSON at {TRADE_LOG_FILE}. File might be corrupted.", exc_info=True)
-        return jsonify([]), 500
-    except Exception as e:
-        app.logger.error(f"Error reading trade log: {e}", exc_info=True)
-        return jsonify([]), 500
-
-@app.route('/api/logs', methods=['GET'])
-def get_production_logs():
-    """Reads and returns the last N lines of the algo engine's log file."""
-    num_lines = request.args.get('lines', default=500, type=int) # Default to 500 lines for logs
-    
-    logs = []
-    if os.path.exists(ALGO_ENGINE_LOG_FILE):
+def load_capital_data():
+    """Loads capital data from a JSON file, creating if not exists."""
+    os.makedirs(os.path.dirname(CAPITAL_FILE), exist_ok=True) # Ensure directory exists
+    if os.path.exists(CAPITAL_FILE):
         try:
-            with open(ALGO_ENGINE_LOG_FILE, 'r') as f:
-                all_lines = f.readlines()
-                logs = [line.strip() for line in all_lines[-num_lines:]]
+            with open(CAPITAL_FILE, 'r') as f:
+                content = f.read()
+                if content:
+                    return json.loads(content)
+        except json.JSONDecodeError:
+            logger.error(f"Capital data file {CAPITAL_FILE} is corrupted. Initializing with BASE_CAPITAL.", exc_info=True)
         except Exception as e:
-            app.logger.error(f"Error reading algo engine log file: {e}", exc_info=True)
-            logs = [f"Error reading logs: {e}"] # Return error message within logs
-    else:
-        logs = [f"Algo engine log file not found at {ALGO_ENGINE_LOG_FILE}. Ensure it's configured to write to persistent disk."]
+            logger.error(f"Error loading capital data: {e}", exc_info=True)
+    logger.info("Capital data file not found or corrupted. Initializing with BASE_CAPITAL.")
+    return {"current_balance": BASE_CAPITAL, "pnl_today": 0.0}
 
-    return jsonify({"logs": logs}), 200 # Return logs in a dictionary under 'logs' key
+def save_capital_data(data):
+    """Saves current capital data to a JSON file."""
+    os.makedirs(os.path.dirname(CAPITAL_FILE), exist_ok=True) # Ensure directory exists
+    try:
+        with open(CAPITAL_FILE, 'w') as f:
+            json.dump(data, f, indent=4)
+        logger.debug("Capital data saved successfully.")
+    except Exception as e:
+        logger.error(f"Error saving capital data: {e}", exc_info=True)
+
+def log_trade(trade_data):
+    """Appends a closed trade's data to a JSON log file for historical trades."""
+    os.makedirs(os.path.dirname(TRADE_LOG_FILE), exist_ok=True) # Ensure directory exists
+    
+    trades = []
+    if os.path.exists(TRADE_LOG_FILE):
+        try:
+            with open(TRADE_LOG_FILE, 'r') as f:
+                content = f.read()
+                if content:
+                    trades = json.loads(content)
+        except json.JSONDecodeError:
+            logger.error(f"Trade log file {TRADE_LOG_FILE} is corrupted. Starting new log.", exc_info=True)
+            trades = []
+        except Exception as e:
+            logger.error(f"Error reading trade log file: {e}", exc_info=True)
+
+    trades.append(trade_data)
+
+    try:
+        with open(TRADE_LOG_FILE, 'w') as f:
+            json.dump(trades, f, indent=4)
+        logger.info(f"Trade logged: {trade_data.get('symbol')} {trade_data.get('signal')} @ {trade_data.get('entry_price')} PnL: {trade_data.get('pnl'):.2f}")
+    except Exception as e:
+        logger.error(f"Error writing trade log: {e}", exc_info=True)
 
 
-# --- Flask Entry Point ---
-if __name__ == '__main__':
-    # Ensure directories for persistent data are created on startup
-    app.logger.info(f"Ensuring persistent disk path exists: {PERSISTENT_DISK_BASE_PATH}")
-    os.makedirs(PERSISTENT_DISK_BASE_PATH, exist_ok=True)
-    os.makedirs(os.path.dirname(ACCESS_TOKEN_STORAGE_FILE), exist_ok=True)
-    os.makedirs(os.path.dirname(TRADE_LOG_FILE), exist_ok=True)
-    os.makedirs(os.path.dirname(ALGO_ENGINE_LOG_FILE), exist_ok=True)
+# --- Fyers API & WebSocket Integration ---
 
-    # For local testing, ensure a dummy token exists if you're not going through auth every time
-    # In a production environment, this file should be created via the /login flow
+def load_access_token():
+    """Loads the Fyers access token from the persistent storage file."""
     if not os.path.exists(ACCESS_TOKEN_STORAGE_FILE):
-        app.logger.warning(f"Access token file not found at {ACCESS_TOKEN_STORAGE_FILE}. "
-                           "Algo will not run without a valid Fyers access token. "
-                           "Please authenticate via /login endpoint.")
-        # You might create a dummy file for local development if you manually set the token for debugging
-        # with open(ACCESS_TOKEN_STORAGE_FILE, 'w') as f:
-        #     json.dump({"access_token": "YOUR_DUMMY_FYERS_ACCESS_TOKEN_FOR_DEV"}, f)
+        logger.error(f"Access token file not found at {ACCESS_TOKEN_STORAGE_FILE}. "
+                     "Please ensure Fyers authentication has completed successfully via the backend /login endpoint.")
+        return None
+    try:
+        with open(ACCESS_TOKEN_STORAGE_FILE, 'r') as f:
+            token_data = json.load(f)
+            return token_data.get("access_token")
+    except json.JSONDecodeError:
+        logger.error(f"Error decoding access token JSON from {ACCESS_TOKEN_STORAGE_FILE}. File might be corrupted.", exc_info=True)
+        return None
+    except Exception as e:
+        logger.error(f"Error loading access token: {e}", exc_info=True)
+        return None
 
-    app.run(host='0.0.0.0', port=os.environ.get('PORT', 5000))
+def init_fyers_client():
+    """Initializes and returns the FyersModel client for REST API calls."""
+    global fyers
+    access_token = load_access_token()
+    if not access_token:
+        logger.error("Fyers access token not available. Cannot initialize REST client.")
+        fyers = None
+        return None
+    
+    if not all([FYERS_APP_ID, FYERS_SECRET_ID]): # Redirect URI not strictly needed for client init
+        logger.error("Missing Fyers API credentials (APP_ID or SECRET_ID). Cannot initialize REST client.")
+        fyers = None
+        return None
+
+    try:
+        fyers = fyersModel.FyersModel(token=access_token, is_async=False, client_id=FYERS_APP_ID)
+        # You can add a small test call here to verify the token, e.g., get_profile()
+        logger.info("Fyers REST client initialization attempt complete.")
+        return fyers
+    except Exception as e:
+        logger.error(f"Error initializing Fyers REST client: {e}", exc_info=True)
+        fyers = None
+        return None
+
+def connect_fyers_websocket():
+    """Establishes and manages Fyers WebSocket connection for real-time data."""
+    global websocket_client
+
+    access_token = load_access_token()
+    if not access_token:
+        logger.error("No Fyers access token found for WebSocket connection. Skipping WS connection.")
+        return False
+
+    client_id_for_ws = FYERS_APP_ID
+    if "-" in FYERS_APP_ID:
+        client_id_for_ws = FYERS_APP_ID.split("-")[0] 
+
+    if websocket_client and websocket_client.is_connected:
+        logger.info("Fyers WebSocket already connected.")
+        return True
+    elif websocket_client: # Client object exists but not connected, attempt reconnect
+        logger.info("Fyers WebSocket not connected, but client exists. Attempting reconnect.")
+        try:
+            websocket_client.connect()
+            return True
+        except Exception as e:
+            logger.error(f"Error reconnecting Fyers WebSocket: {e}", exc_info=True)
+            websocket_client = None # Reset client object if reconnect fails
+    
+    def on_open(ws_app):
+        logger.info("Fyers WebSocket connection opened.")
+        # Subscribe to all symbols defined in SYMBOLS_TO_MONITOR
+        ws_app.subscribe(symbols=SYMBOLS_TO_MONITOR, data_type="symbolData")
+        logger.info(f"Subscribed to symbols for real-time data: {SYMBOLS_TO_MONITOR}")
+
+    def on_message(ws_app, message):
+        global latest_prices, historical_data
+        # Process the received message and update the global latest_prices dictionary
+        if isinstance(message, dict) and "symbol" in message and "ltp" in message:
+            symbol = message["symbol"]
+            ltp = message["ltp"]
+            
+            latest_prices[symbol] = {
+                "ltp": ltp,
+                "timestamp": datetime.now().isoformat()
+            }
+            # Append to historical data deque for indicator calculations
+            if symbol in historical_data:
+                historical_data[symbol].append(ltp)
+            
+            # logger.debug(f"Updated LTP for {symbol}: {ltp}") # This can be very verbose
+
+    def on_error(ws_app, error):
+        logger.error(f"Fyers WebSocket error: {error}", exc_info=True)
+
+    def on_close(ws_app):
+        logger.info("Fyers WebSocket connection closed.")
+        global websocket_client
+        websocket_client = None
+
+    try:
+        os.makedirs(FYERS_WS_LOG_DIR, exist_ok=True) # Ensure WS log directory exists
+        websocket_client = data_ws.FyersDataSocket(
+            access_token=f"{client_id_for_ws}:{access_token}",
+            log_path=FYERS_WS_LOG_DIR, # Save WebSocket library logs to persistent disk
+            litemode=True, # Subscribe to basic LTP updates for symbols
+            on_message=on_message,
+            on_error=on_error,
+            on_close=on_close,
+            # Removed 'on_open' as per the TypeError traceback
+            enable_websocket_log=True
+        )
+        logger.info("Attempting to connect Fyers WebSocket...")
+        websocket_client.connect()
+        return True
+    except Exception as e:
+        logger.error(f"Failed to connect Fyers WebSocket: {e}", exc_info=True)
+        websocket_client = None
+        return False
+
+def close_fyers_websocket():
+    """Closes the Fyers WebSocket connection if open."""
+    global websocket_client
+    if websocket_client and websocket_client.is_connected:
+        logger.info("Closing Fyers WebSocket connection.")
+        websocket_client.close()
+        websocket_client = None
+
+
+# --- Market Hours Check ---
+def is_market_open():
+    """Checks if the Indian stock market (NSE/BSE) is currently open."""
+    ist = pytz.timezone('Asia/Kolkata')
+    now_utc = datetime.now(pytz.utc) # Get current UTC time, aware
+    now_ist = datetime.now(ist) # Get current IST time, aware
+
+    market_open_time = now_ist.replace(hour=9, minute=15, second=0, microsecond=0)
+    market_close_time = now_ist.replace(hour=15, minute=30, second=0, microsecond=0)
+
+    is_weekday = 0 <= now_ist.weekday() <= 4 # Monday (0) to Friday (4)
+
+    is_open = is_weekday and (market_open_time <= now_ist <= market_close_time)
+    
+    # --- ENHANCED DEBUGGING LOGS ---
+    logger.debug(f"DEBUG: Current UTC time (aware): {now_utc}")
+    logger.debug(f"DEBUG: Current IST time (aware): {now_ist}")
+    logger.debug(f"DEBUG: Market Open Time IST: {market_open_time}")
+    logger.debug(f"DEBUG: Market Close Time IST: {market_close_time}")
+    logger.debug(f"DEBUG: Is Weekday ({now_ist.strftime('%A')}): {is_weekday}")
+    logger.debug(f"DEBUG: Is Market Open calculated: {is_open}")
+    # --- END DEBUG LOGS ---
+
+    if not is_open:
+        if not is_weekday:
+            logger.debug(f"Market is closed: Weekend ({now_ist.strftime('%A')}).")
+        elif now_ist < market_open_time:
+            logger.debug(f"Market is closed: Before opening hours. Current IST: {now_ist.strftime('%H:%M:%S')}")
+        elif now_ist > market_close_time:
+            logger.debug(f"Market is closed: After closing hours. Current IST: {now_ist.strftime('%H:%M:%S')}")
+    else:
+        logger.debug(f"Market is OPEN. Current IST: {now_ist.strftime('%H:%M:%S')}")
+    
+    return is_open
+
+
+# --- Strategy Indicator Calculations (Placeholders for your existing logic) ---
+# Assuming your original code had functions like these.
+# You would implement the actual calculation logic here using 'historical_data' or other data sources.
+
+def calculate_ema(prices, period):
+    if len(prices) < period:
+        return None
+    ema = [0.0] * len(prices)
+    smoothing_factor = 2 / (period + 1)
+    
+    # Simple moving average for the first EMA calculation
+    ema[period - 1] = sum(prices[:period]) / period
+    
+    for i in range(period, len(prices)):
+        ema[i] = (prices[i] - ema[i-1]) * smoothing_factor + ema[i-1]
+    return ema[-1] # Return the latest EMA
+
+def calculate_rsi(prices, period=RSI_PERIOD):
+    if len(prices) < period + 1:
+        return None
+    
+    deltas = np.diff(prices)
+    gains = deltas[deltas > 0]
+    losses = -deltas[deltas < 0] # Losses are positive values
+
+    avg_gain = np.mean(gains[:period]) if len(gains) > 0 else 0
+    avg_loss = np.mean(losses[:period]) if len(losses) > 0 else 0
+
+    if avg_loss == 0:
+        return 100 if avg_gain > 0 else 50 # Avoid division by zero
+    
+    rs = avg_gain / avg_loss
+    rsi = 100 - (100 / (1 + rs))
+    return rsi
+
+def calculate_macd(prices, fast_period=MACD_FAST_PERIOD, slow_period=MACD_SLOW_PERIOD, signal_period=MACD_SIGNAL_PERIOD):
+    if len(prices) < max(fast_period, slow_period, signal_period):
+        return None, None, None
+
+    # This is a simplified calculation for the latest MACD, typically requires more historical EMAs
+    ema_fast = calculate_ema(prices, fast_period)
+    ema_slow = calculate_ema(prices, slow_period)
+
+    if ema_fast is None or ema_slow is None:
+        return None, None, None
+
+    macd_line = ema_fast - ema_slow
+    
+    # To calculate the MACD signal line, you'd need a series of MACD line values
+    # For now, we'll return None for signal and histogram unless a series is available.
+    # In a full implementation, you'd store a history of macd_line values and then calculate EMA of *that* for signal line.
+    
+    return macd_line, None, None # macd_line, signal_line, histogram
+
+
+# --- Core Algo Engine Functionality ---
+
+def execute_strategy(algo_status_dict, app_logger_instance):
+    """
+    Main function to execute the trading strategy. Runs in a separate thread.
+    algo_status_dict: A shared dictionary to control the algo's running state from the Flask app.
+    app_logger_instance: The Flask app's logger instance (optional, for Flask-specific logging within algo).
+    """
+    global fyers, websocket_client, current_capital_data, active_trades, latest_prices, historical_data
+
+    logger.info("Jannat Algo Engine thread started. Initializing...")
+    
+    current_capital_data = load_capital_data() # Load initial capital data
+
+    # Initialize Fyers REST client (for placing orders, etc.)
+    fyers = init_fyers_client()
+    if not fyers:
+        logger.error("Fyers REST client initialization failed. Algo will run in simulated trading mode only (no real orders).")
+        # Algo continues to run, but only simulates trades and updates local state.
+
+    # Connect WebSocket for real-time data streaming
+    connect_fyers_websocket()
+
+    logger.info(f"Starting with capital: {current_capital_data['current_balance']:.2f}")
+
+    # Main loop for the algo engine
+    while algo_status_dict.get("status") == "running":
+        try:
+            # --- Market Hours Check ---
+            if not is_market_open():
+                logger.info("Market is closed. Pausing algo activity and closing WebSocket.")
+                close_fyers_websocket()
+                time.sleep(60) # Wait for 1 minute before re-checking market status
+                continue # Skip trading logic until market re-opens
+            
+            # --- WebSocket Connection Check (if market is open) ---
+            if not websocket_client or not websocket_client.is_connected:
+                logger.warning("Market is OPEN, but WebSocket is not connected. Attempting to reconnect.")
+                connect_fyers_websocket() # Attempt to reconnect
+                if not websocket_client or not websocket_client.is_connected:
+                    logger.error("Failed to connect WebSocket. Real-time data will not be streamed for decisions.")
+                    time.sleep(30) # Wait before next attempt to avoid hammering
+                    continue
+
+            logger.info("Algo engine running: Market is open and WebSocket is active.")
+
+            # --- YOUR TRADING STRATEGY GOES HERE ---
+            # This is where you will integrate your RSI, MACD, etc., logic.
+            # You now have access to 'latest_prices' and 'historical_data' from WebSocket.
+
+            for symbol in SYMBOLS_TO_MONITOR:
+                current_ltp_info = latest_prices.get(symbol)
+                
+                if not current_ltp_info:
+                    logger.debug(f"No real-time data for {symbol} yet. Skipping strategy for this symbol.")
+                    continue
+
+                current_ltp = current_ltp_info["ltp"]
+                
+                # Ensure enough historical data for calculations
+                if len(historical_data[symbol]) < max(EMA_SLOW_PERIOD, RSI_PERIOD, MACD_SLOW_PERIOD) + 1:
+                    logger.info(f"Collecting historical data for {symbol}. Current points: {len(historical_data[symbol])}/{WINDOW_SIZE}")
+                    # Continue collecting data; strategy won't activate until enough data points.
+                    continue
+                
+                # --- Calculate Indicators ---
+                # Example: You would use historical_data[symbol] (which is a deque of prices)
+                # to calculate your indicators.
+                prices_list = list(historical_data[symbol]) # Convert deque to list for numpy/slicing
+                
+                # Replace with your actual indicator calculations
+                current_rsi = calculate_rsi(prices_list)
+                macd_line, macd_signal_line, macd_histogram = calculate_macd(prices_list)
+                
+                logger.debug(f"Symb
